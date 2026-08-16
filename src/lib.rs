@@ -1,7 +1,7 @@
 //! OS-level process confinement for spawned command execution: Landlock
 //! (filesystem scoping) + a seccomp-bpf syscall denylist. See
-//! `ExecutionConfiner`'s own doc comment (added in a later commit) for
-//! the contract every implementation must satisfy.
+//! `ExecutionConfiner`'s own doc comment for the contract every
+//! implementation must satisfy.
 
 use std::path::{Path, PathBuf};
 
@@ -34,8 +34,8 @@ impl ExecutionConfiner for NoopConfiner {
 /// resolve. `pub` because two independent consumers need to classify a
 /// `deny_paths` entry identically rather than each re-deriving the same
 /// check on their own: this crate's own `LandlockConfiner` (via
-/// `find_basename_glob_matches`, added in a later commit), and
-/// `aivyx-sandbox`'s `path_is_denied` — a distinct, cross-crate consumer
+/// `find_basename_glob_matches`), and `aivyx-sandbox`'s `path_is_denied`
+/// (in `aivyx-coder`) — a distinct, cross-crate consumer
 /// unrelated to process confinement (it gates `ConfirmationGate`'s
 /// permission decisions), found by reading `aivyx-sandbox`'s actual
 /// current code before this crate was designed, not assumed.

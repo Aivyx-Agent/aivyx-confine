@@ -1,7 +1,9 @@
 //! Real OS-level process confinement, replacing `NoopConfiner`: Landlock
-//! (filesystem scoping) + a seccomp-bpf syscall denylist. See the Phase 5
-//! plan for the policy rationale (informed by, but deliberately not
-//! identical to, Codex CLI's current bubblewrap-based sandbox).
+//! (filesystem scoping) + a seccomp-bpf syscall denylist. See
+//! `aivyx-ecosystem/docs/superpowers/specs/2026-08-16-aivyx-confine-design.md`
+//! and this crate's own `CLAUDE.md` ("The `ExecutionConfiner` contract")
+//! for the policy rationale (informed by, but deliberately not identical
+//! to, Codex CLI's current bubblewrap-based sandbox).
 
 use std::io;
 use std::path::{Path, PathBuf};
