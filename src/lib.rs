@@ -5,6 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "sandbox-backend")]
+mod confiner;
+#[cfg(feature = "sandbox-backend")]
+pub use confiner::LandlockConfiner;
+
 /// Wraps/restricts an about-to-spawn process before it execs.
 /// `NoopConfiner` is the identity fallback (for platforms/kernels without
 /// Landlock, or with `sandbox-backend` disabled at build time);
@@ -48,6 +53,35 @@ pub fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
     globset::Glob::new(pattern)
         .map(|glob| glob.compile_matcher().is_match(name))
         .unwrap_or(false)
+}
+
+/// Builds the best confiner available for this build: `LandlockConfiner`
+/// when the `sandbox-backend` feature is enabled (the default), otherwise
+/// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
+/// in every caller.
+#[cfg(feature = "sandbox-backend")]
+pub fn default_confiner(
+    cwd: &Path,
+    extra_read_paths: &[PathBuf],
+    deny_paths: &[PathBuf],
+    require_enforcement: bool,
+) -> std::sync::Arc<dyn ExecutionConfiner> {
+    std::sync::Arc::new(LandlockConfiner::new(
+        cwd,
+        extra_read_paths,
+        deny_paths,
+        require_enforcement,
+    ))
+}
+
+#[cfg(not(feature = "sandbox-backend"))]
+pub fn default_confiner(
+    _cwd: &Path,
+    _extra_read_paths: &[PathBuf],
+    _deny_paths: &[PathBuf],
+    _require_enforcement: bool,
+) -> std::sync::Arc<dyn ExecutionConfiner> {
+    std::sync::Arc::new(NoopConfiner)
 }
 
 #[cfg(test)]
