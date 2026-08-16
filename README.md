@@ -18,9 +18,10 @@ config-file parsing of its own. Each consumer's own config crate resolves
 `deny_paths`/`extra_read_paths`/`require_enforcement` from whatever
 config format it uses and passes the resolved values in.
 
-Extracted 2026-08-16 from `aivyx-coder`'s own `aivyx-sandbox` crate, which
-now depends on this crate instead of maintaining its own copy (see that
-repo's `CLAUDE.md` for the migration). Built so `aivyx` (the flagship
+Extracted 2026-08-16 from `aivyx-coder`'s own `aivyx-sandbox` crate.
+`aivyx-coder`'s migration onto this crate — replacing its own copy of this
+code with a dependency on this one — is a separate, planned next step, not
+yet done as of this crate's initial commit. Built so `aivyx` (the flagship
 Personal Assistant, whose own `ShellExecTool` currently has no OS-level
 confinement — a gap its own `docs/THREAT_MODEL.md` states outright) could
 adopt the same primitive — not yet done; that integration is separate,

@@ -16,9 +16,10 @@ and potentially drifting on — its own copy. See `README.md` and
 for the full rationale — this file only covers what's specific to working
 in this repo's code.
 
-`aivyx-coder`'s own `aivyx-sandbox` crate depends on this crate today
-(migrated 2026-08-16). `aivyx` does not yet — that integration is
-separate follow-on work, tracked outside this repo.
+`aivyx-coder`'s own `aivyx-sandbox` crate is planned to depend on this
+crate, replacing its own copy of this code — that migration has not happened
+yet as of this crate's initial commit. `aivyx` does not yet — that
+integration is separate follow-on work, tracked outside this repo.
 
 ## Build, test, lint
 
