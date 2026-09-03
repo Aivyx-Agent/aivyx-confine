@@ -18,8 +18,13 @@ in this repo's code.
 
 `aivyx-coder`'s own `aivyx-sandbox` crate depends on this crate today
 (migrated 2026-08-16, the same day this crate was extracted) — see that
-repo's own `CLAUDE.md` "Sandbox internals" section. `aivyx` does not yet —
-that integration is separate follow-on work, tracked outside this repo.
+repo's own `CLAUDE.md` "Sandbox internals" section. **`aivyx` (the
+flagship Personal Assistant) also depends on this crate**, adopted
+2026-08-17/18 — `ShellExecTool` (one persistent confiner) and `git.rs`'s
+three tools (a fresh, per-call confiner scoped to whichever repo the
+call resolves) both route through it, target-gated to Linux only (see
+`aivyx-ecosystem/ROADMAP.md`'s `aivyx-confine` entry for the platform-gate
+fix a final review caught). Both real consumers now depend on this crate.
 
 ## Build, test, lint
 
@@ -76,7 +81,8 @@ before fork, for exactly this reason.
 
 - `README.md` — quick orientation and the design-doc pointer.
 - `aivyx-ecosystem/docs/superpowers/specs/2026-08-16-aivyx-confine-design.md`
-  — the full design: why this was extracted, why `aivyx-coder`'s
-  migration is part of the same project (unlike `aivyx-recall`/
-  `aivyx-kvcache`, which shipped standalone with no consumer yet), and
-  `aivyx`'s adoption as explicit deferred follow-on.
+  — the full design: why this was extracted, and why `aivyx-coder`'s
+  migration was part of the same project (unlike `aivyx-recall`/
+  `aivyx-kvcache`, which shipped standalone with no consumer yet).
+  `aivyx`'s own adoption (2026-08-17/18) has its own design docs in that
+  repo — see `aivyx-ecosystem/ROADMAP.md`'s `aivyx-confine` entry.
