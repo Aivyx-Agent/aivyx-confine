@@ -403,7 +403,20 @@ impl ExecutionConfiner for LandlockConfiner {
                     let status = ruleset
                         .restrict_self()
                         .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
-                    if require_enforcement && status.ruleset != RulesetStatus::FullyEnforced {
+                    // `PartiallyEnforced` means the kernel supports Landlock
+                    // but not every requested restriction at `LANDLOCK_ABI`
+                    // — Landlock's own designed graceful-degradation
+                    // behavior (older kernel, newer ABI requested), not an
+                    // absence of enforcement. Only `NotEnforced` (no real
+                    // restriction applied at all) should trip
+                    // `require_enforcement`'s fail-closed policy; refusing
+                    // on `PartiallyEnforced` too was stricter than intended
+                    // and broke real confined execution on any kernel that
+                    // doesn't yet support the full `LANDLOCK_ABI` level —
+                    // found via CI failing outright on GitHub's runner
+                    // kernel, which lands on `PartiallyEnforced` for this
+                    // ABI target.
+                    if require_enforcement && status.ruleset == RulesetStatus::NotEnforced {
                         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                     }
                 }
