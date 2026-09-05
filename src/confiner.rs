@@ -61,6 +61,21 @@ const DEVICE_RW_PATHS: &[&str] = &["/dev/null", "/dev/zero", "/dev/urandom", "/d
 /// capability dropping. This design doesn't use namespaces, so those need
 /// to be explicit here instead. `unshare`/`setns` are blocked outright since
 /// a coding agent's tools never need to create or join namespaces.
+// `libc::SYS_kexec_file_load` is genuinely absent from this crate's musl
+// bindings for aarch64 and riscv64 (confirmed directly against
+// libc-0.2.189's source: present for musl x86_64/loongarch64/s390x/
+// powerpc64, absent for musl aarch64/riscv64 — an upstream musl libc
+// binding gap, not something this crate can paper over with a cfg on a
+// single array element, since `cfg` doesn't apply to individual
+// expressions inside an array literal). Two full `cfg`-gated versions of
+// the same const, rather than a fallible numeric fallback per
+// architecture, keeps every entry auditable as a real `libc::SYS_*`
+// constant. `SYS_kexec_load` (the non-file variant) is unaffected and
+// stays blocked on every target either way.
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_env = "musl"),
+    all(target_arch = "riscv64", target_env = "musl"),
+)))]
 const BLOCKED_SYSCALLS: &[i64] = &[
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
@@ -73,6 +88,52 @@ const BLOCKED_SYSCALLS: &[i64] = &[
     libc::SYS_reboot,
     libc::SYS_kexec_load,
     libc::SYS_kexec_file_load,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_pivot_root,
+    libc::SYS_swapon,
+    libc::SYS_swapoff,
+    libc::SYS_acct,
+    libc::SYS_bpf,
+    libc::SYS_perf_event_open,
+    libc::SYS_keyctl,
+    libc::SYS_add_key,
+    libc::SYS_request_key,
+    libc::SYS_userfaultfd,
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    libc::SYS_personality,
+];
+
+/// Syscalls with no legitimate use in a coding agent's shell commands,
+/// blocked regardless of what Landlock's filesystem scoping already
+/// prevents — defense in depth against confinement-escape/introspection
+/// primitives (`ptrace`, `io_uring`, `perf_event_open`, the kernel keyring,
+/// `userfaultfd`) and privileged operations that a namespace-based sandbox
+/// (like Codex CLI's bubblewrap) would otherwise block for free via
+/// capability dropping. This design doesn't use namespaces, so those need
+/// to be explicit here instead. `unshare`/`setns` are blocked outright since
+/// a coding agent's tools never need to create or join namespaces.
+///
+/// Identical to the list above minus `SYS_kexec_file_load`, which this
+/// crate's musl bindings don't define on aarch64/riscv64 — see that
+/// item's own comment above.
+#[cfg(any(
+    all(target_arch = "aarch64", target_env = "musl"),
+    all(target_arch = "riscv64", target_env = "musl"),
+))]
+const BLOCKED_SYSCALLS: &[i64] = &[
+    libc::SYS_ptrace,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_reboot,
+    libc::SYS_kexec_load,
     libc::SYS_init_module,
     libc::SYS_finit_module,
     libc::SYS_delete_module,
