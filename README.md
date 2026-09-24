@@ -1,7 +1,7 @@
 # aivyx-confine
 
 [![CI](https://github.com/Aivyx-Agent/aivyx-confine/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Aivyx-Agent/aivyx-confine/actions/workflows/ci.yml)
-[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
 OS-level process confinement (Landlock + seccomp-bpf) for spawned command
 execution.

@@ -3,7 +3,8 @@ name = "aivyx-confine"
 description = "OS-level process confinement (Landlock + seccomp-bpf) for spawned command execution"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
+publish = false
 
 [dependencies]
 globset = "0.4.18"
