@@ -1472,8 +1472,16 @@ impl LandlockConfiner {
                         error = %err,
                         "failed to build Landlock ruleset; refusing to run unconfined"
                     );
+                    // The child's error reaches the caller as its raw errno
+                    // (std reports EINVAL for an error without one), so
+                    // name the cause: EMFILE for descriptor exhaustion,
+                    // EACCES for "Landlock could not be applied".
+                    let errno = match err {
+                        BuildError::Exhausted => libc::EMFILE,
+                        _ => libc::EACCES,
+                    };
                     unsafe {
-                        command.pre_exec(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+                        command.pre_exec(move || Err(io::Error::from_raw_os_error(errno)));
                     }
                     return command;
                 }
@@ -1495,9 +1503,11 @@ impl LandlockConfiner {
         // memory, so moving it into `restrict_self` in the child is fine.
         let seccomp_programs = self.seccomp_programs.clone();
 
-        // SAFETY: every error path inside this closure uses an
-        // `ErrorKind`-based `io::Error` (std's allocation-free "simple"
-        // repr), never `io::Error::other`/`.to_string()` — both allocate,
+        // SAFETY: every error path inside this closure uses
+        // `io::Error::from_raw_os_error` (std's allocation-free `Os`
+        // repr, which also reaches the caller as that errno rather than
+        // std's EINVAL fallback), never `io::Error::other`/`.to_string()`
+        // — both allocate,
         // which is unsound inside a forked, single-threaded child where
         // another thread's held malloc-arena lock at fork time can leave
         // the allocator permanently wedged from this process's point of
@@ -1510,7 +1520,7 @@ impl LandlockConfiner {
                 if let Some(ruleset) = ruleset.take() {
                     let status = ruleset
                         .restrict_self()
-                        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
                     // `PartiallyEnforced` means the kernel supports Landlock
                     // but not every requested restriction at `LANDLOCK_ABI`
                     // — Landlock's own designed graceful-degradation
@@ -1533,12 +1543,12 @@ impl LandlockConfiner {
                     // drops the signal and abstract-socket scopes. The
                     // seccomp layer does not depend on the ABI.
                     if require_enforcement && status.ruleset == RulesetStatus::NotEnforced {
-                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                        return Err(io::Error::from_raw_os_error(libc::EACCES));
                     }
                 }
                 for program in &seccomp_programs {
                     seccompiler::apply_filter(program)
-                        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
                 }
                 Ok(())
             });
@@ -2459,6 +2469,30 @@ mod tests {
             stdout.lines().any(|l| l == "RLIMIT build=exhausted"),
             "unexpected helper output: {stdout}"
         );
+    }
+
+    #[tokio::test]
+    async fn refused_spawns_report_a_specific_errno() {
+        let dir = fixture_dir();
+        let lax = LandlockConfiner::new(dir.path(), &[], &[], false);
+        let err = lax
+            .confine_with_ruleset(
+                tokio::process::Command::new("true"),
+                Err(BuildError::Exhausted),
+            )
+            .status()
+            .await
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE), "{err}");
+
+        let mut strict = confiner_for(dir.path());
+        strict.force_ruleset_failure = true;
+        let err = strict
+            .confine(tokio::process::Command::new("true"))
+            .status()
+            .await
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
     }
 
     #[tokio::test]

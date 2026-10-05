@@ -102,9 +102,12 @@ and returns it, possibly wrapped with a `pre_exec` hook (`LandlockConfiner`)
 or unchanged (`NoopConfiner`). Callers apply this immediately before
 `.spawn()`. `LandlockConfiner::confine`'s `pre_exec` closure runs
 post-fork, pre-exec, under async-signal-safety constraints (no
-allocation, no locks) — every error path inside it uses an
-`ErrorKind`-based `io::Error`, never `.to_string()`/`io::Error::other`
-(both allocate). All ruleset/filter construction happens in the parent,
+allocation, no locks) — every error path inside it uses
+`io::Error::from_raw_os_error`, never `.to_string()`/`io::Error::other`
+(both allocate). The raw errno is what the caller's `spawn()` error
+carries: `EACCES` when Landlock can't be applied under
+`require_enforcement`, `EMFILE` when the parent ran out of descriptors
+building the ruleset, `EPERM` when applying it in the child fails. All ruleset/filter construction happens in the parent,
 before fork, for exactly this reason — including the per-spawn grant
 computation, which walks the filesystem when bare-pattern denies are
 configured, so `confine()` itself can block briefly. `confine()` also
