@@ -1264,7 +1264,12 @@ impl LandlockConfiner {
                 None
             }
         };
-        let mut seccomp_programs = Some(self.seccomp_programs.clone());
+        // Cloned here, in the parent, and only *borrowed* in the child:
+        // the closure owns it, so it is freed by the parent when the
+        // `Command` is dropped, never by the forked child (freeing after
+        // fork is as unsafe as allocating). `RulesetCreated` owns no heap
+        // memory, so moving it into `restrict_self` in the child is fine.
+        let seccomp_programs = self.seccomp_programs.clone();
 
         // SAFETY: every error path inside this closure uses an
         // `ErrorKind`-based `io::Error` (std's allocation-free "simple"
@@ -1307,11 +1312,9 @@ impl LandlockConfiner {
                         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                     }
                 }
-                if let Some(programs) = seccomp_programs.take() {
-                    for program in &programs {
-                        seccompiler::apply_filter(program)
-                            .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
-                    }
+                for program in &seccomp_programs {
+                    seccompiler::apply_filter(program)
+                        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
                 }
                 Ok(())
             });
