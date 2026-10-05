@@ -55,31 +55,89 @@ pub fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Policy knobs for `LandlockConfiner::with_options` /
+/// `default_confiner_with_options`. `ConfineOptions::default()` is the
+/// strict policy every field's own doc describes; each `bool` that is
+/// `false` by default is an explicit opt-out a consumer must choose.
+/// `#[non_exhaustive]` so new knobs can be added without breaking
+/// consumers: build one with `ConfineOptions::new()` and the setters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConfineOptions {
+    /// Refuse to spawn (rather than run unconfined) when Landlock cannot
+    /// be applied at all. Same meaning as the `require_enforcement`
+    /// argument of `LandlockConfiner::new`.
+    pub require_enforcement: bool,
+    /// Opt out of the seccomp rule that makes `socket(AF_UNIX, ...)` fail
+    /// with `EPERM`. Landlock does not gate `connect()` to an existing
+    /// pathname Unix socket, so without that rule a confined command can
+    /// reach any local daemon the user can — including the D-Bus session
+    /// bus (`systemd-run --user` = unconfined code execution), gpg-agent,
+    /// ssh-agent, Wayland/X11 and `docker.sock`. Only set this when the
+    /// confined commands genuinely need a local daemon, and accept that
+    /// the sandbox no longer contains code execution in that case.
+    /// `socketpair()` keeps working either way.
+    pub allow_unix_sockets: bool,
+}
+
+impl ConfineOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn require_enforcement(mut self, value: bool) -> Self {
+        self.require_enforcement = value;
+        self
+    }
+
+    pub fn allow_unix_sockets(mut self, value: bool) -> Self {
+        self.allow_unix_sockets = value;
+        self
+    }
+}
+
 /// Builds the best confiner available for this build: `LandlockConfiner`
 /// when the `sandbox-backend` feature is enabled (the default), otherwise
 /// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
-/// in every caller.
-#[cfg(feature = "sandbox-backend")]
+/// in every caller. Equivalent to `default_confiner_with_options` with
+/// `ConfineOptions::new().require_enforcement(require_enforcement)`.
 pub fn default_confiner(
     cwd: &Path,
     extra_read_paths: &[PathBuf],
     deny_paths: &[PathBuf],
     require_enforcement: bool,
 ) -> std::sync::Arc<dyn ExecutionConfiner> {
-    std::sync::Arc::new(LandlockConfiner::new(
+    default_confiner_with_options(
         cwd,
         extra_read_paths,
         deny_paths,
-        require_enforcement,
+        ConfineOptions::new().require_enforcement(require_enforcement),
+    )
+}
+
+/// `default_confiner` with every policy knob exposed — see
+/// `ConfineOptions`.
+#[cfg(feature = "sandbox-backend")]
+pub fn default_confiner_with_options(
+    cwd: &Path,
+    extra_read_paths: &[PathBuf],
+    deny_paths: &[PathBuf],
+    options: ConfineOptions,
+) -> std::sync::Arc<dyn ExecutionConfiner> {
+    std::sync::Arc::new(LandlockConfiner::with_options(
+        cwd,
+        extra_read_paths,
+        deny_paths,
+        options,
     ))
 }
 
 #[cfg(not(feature = "sandbox-backend"))]
-pub fn default_confiner(
+pub fn default_confiner_with_options(
     _cwd: &Path,
     _extra_read_paths: &[PathBuf],
     _deny_paths: &[PathBuf],
-    _require_enforcement: bool,
+    _options: ConfineOptions,
 ) -> std::sync::Arc<dyn ExecutionConfiner> {
     std::sync::Arc::new(NoopConfiner)
 }

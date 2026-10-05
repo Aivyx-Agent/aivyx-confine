@@ -12,7 +12,10 @@ use landlock::{
     ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
     path_beneath_rules,
 };
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule,
+};
 
 use crate::ExecutionConfiner;
 
@@ -172,6 +175,20 @@ fn detect_landlock_abi() -> i64 {
     }
 }
 
+/// Environment variables that point a process at a session-level IPC
+/// endpoint (D-Bus, ssh-agent, gpg-agent, Wayland, X11, the user runtime
+/// dir that holds most of their sockets). Removed from every confined
+/// command — see `ConfineOptions::allow_unix_sockets` for why reaching
+/// those endpoints is an escape, not just an information leak.
+pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+];
+
 pub struct LandlockConfiner {
     read_paths: Vec<PathBuf>,
     write_paths: Vec<PathBuf>,
@@ -180,12 +197,29 @@ pub struct LandlockConfiner {
 }
 
 impl LandlockConfiner {
+    /// The default policy (`ConfineOptions::new()`) plus
+    /// `require_enforcement` — kept as the original, stable constructor.
     pub fn new(
         cwd: &Path,
         extra_read_paths: &[PathBuf],
         deny_paths: &[PathBuf],
         require_enforcement: bool,
     ) -> Self {
+        Self::with_options(
+            cwd,
+            extra_read_paths,
+            deny_paths,
+            crate::ConfineOptions::new().require_enforcement(require_enforcement),
+        )
+    }
+
+    pub fn with_options(
+        cwd: &Path,
+        extra_read_paths: &[PathBuf],
+        deny_paths: &[PathBuf],
+        options: crate::ConfineOptions,
+    ) -> Self {
+        let require_enforcement = options.require_enforcement;
         if detect_landlock_abi() < 0 {
             tracing::warn!(
                 require_enforcement,
@@ -260,7 +294,7 @@ impl LandlockConfiner {
         // silently skips any that don't exist.
         write_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let seccomp_program = build_seccomp_filter();
+        let seccomp_program = build_seccomp_filter(&options);
 
         Self {
             read_paths,
@@ -396,11 +430,34 @@ fn walk_for_basename_matches(dir: &Path, bare_patterns: &[PathBuf], matches: &mu
     }
 }
 
-fn build_seccomp_filter() -> BpfProgram {
-    let rules = BLOCKED_SYSCALLS
+fn build_seccomp_filter(options: &crate::ConfineOptions) -> BpfProgram {
+    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = BLOCKED_SYSCALLS
         .iter()
         .map(|&syscall| (syscall, vec![]))
         .collect();
+    if !options.allow_unix_sockets {
+        // `socket(AF_UNIX, ...)` → EPERM: Landlock does not gate
+        // `connect()` to an existing pathname Unix socket, so this is the
+        // only thing standing between a confined command and the user's
+        // D-Bus session bus (`systemd-run --user` runs arbitrary code
+        // unconfined), gpg-agent, ssh-agent, Wayland/X11 and docker.sock.
+        // `socketpair()` is a different syscall and stays allowed.
+        rules.insert(
+            libc::SYS_socket,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        libc::AF_UNIX as u64,
+                    )
+                    .expect("static seccomp condition is well-formed"),
+                ])
+                .expect("static seccomp rule is well-formed"),
+            ],
+        );
+    }
 
     SeccompFilter::new(
         rules,
@@ -416,6 +473,9 @@ fn build_seccomp_filter() -> BpfProgram {
 impl ExecutionConfiner for LandlockConfiner {
     fn confine(&self, mut command: tokio::process::Command) -> tokio::process::Command {
         let require_enforcement = self.require_enforcement;
+        for var in SCRUBBED_ENV_VARS {
+            command.env_remove(var);
+        }
 
         let ruleset = match self.build_ruleset() {
             Ok(ruleset) => ruleset,
@@ -536,6 +596,188 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ),
         )
+    }
+
+    // --- Re-exec helper -------------------------------------------------
+    //
+    // Syscall-level properties (socket families, clone flags, signals) are
+    // tested by re-running this very test binary, confined, with only
+    // `helper_entry` selected and an action named in `HELPER_ENV`. The
+    // helper performs exactly one raw syscall and prints its return value
+    // and errno, so no external tool (python, socat, ...) is needed.
+
+    const HELPER_ENV: &str = "AIVYX_CONFINE_TEST_HELPER";
+    const HELPER_ARG_ENV: &str = "AIVYX_CONFINE_TEST_HELPER_ARG";
+
+    fn last_errno() -> i32 {
+        io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    /// Runs one raw syscall-ish action and returns `(ret, errno)`; errno
+    /// is only meaningful when `ret < 0`.
+    fn helper_action(action: &str, arg: &str) -> (i64, i32) {
+        // SAFETY: each arm is a single raw libc call on locally owned
+        // buffers; this runs only in the re-exec'd helper process.
+        unsafe {
+            match action {
+                "unix_socket" => {
+                    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    let errno = last_errno();
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
+                    (fd as i64, errno)
+                }
+                "unix_connect" => {
+                    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    if fd < 0 {
+                        return (fd as i64, last_errno());
+                    }
+                    let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                    let abstract_name = arg.strip_prefix('@');
+                    let bytes = abstract_name.unwrap_or(arg).as_bytes();
+                    let offset = usize::from(abstract_name.is_some());
+                    for (i, b) in bytes.iter().enumerate() {
+                        addr.sun_path[i + offset] = *b as libc::c_char;
+                    }
+                    let len = std::mem::size_of::<libc::sa_family_t>() + offset + bytes.len();
+                    let ret = libc::connect(
+                        fd,
+                        &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                        len as libc::socklen_t,
+                    );
+                    let errno = last_errno();
+                    libc::close(fd);
+                    (ret as i64, errno)
+                }
+                "socketpair" => {
+                    let mut fds = [0; 2];
+                    let ret =
+                        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+                    (ret as i64, last_errno())
+                }
+                other => panic!("unknown helper action {other}"),
+            }
+        }
+    }
+
+    /// Not a real test: a no-op unless re-exec'd by `run_helper`.
+    #[test]
+    fn helper_entry() {
+        let Ok(action) = std::env::var(HELPER_ENV) else {
+            return;
+        };
+        let arg = std::env::var(HELPER_ARG_ENV).unwrap_or_default();
+        let (ret, errno) = helper_action(&action, &arg);
+        println!("HELPER_RESULT ret={ret} errno={errno}");
+    }
+
+    fn test_exe() -> PathBuf {
+        std::env::current_exe().unwrap()
+    }
+
+    /// The read grant the re-exec'd helper needs for its own binary.
+    fn helper_read_paths() -> Vec<PathBuf> {
+        vec![test_exe().parent().unwrap().to_path_buf()]
+    }
+
+    fn helper_command(action: &str, arg: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(test_exe());
+        command
+            .args([
+                "--exact",
+                "confiner::tests::helper_entry",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(HELPER_ENV, action)
+            .env(HELPER_ARG_ENV, arg);
+        command
+    }
+
+    async fn run_helper(confiner: &LandlockConfiner, action: &str, arg: &str) -> (i64, i32) {
+        let (_, output) = run(confiner.confine(helper_command(action, arg))).await;
+        let line = output
+            .lines()
+            .find_map(|l| l.strip_prefix("HELPER_RESULT "))
+            .unwrap_or_else(|| panic!("helper produced no result: {output}"));
+        let mut ret = None;
+        let mut errno = None;
+        for field in line.split_whitespace() {
+            if let Some(v) = field.strip_prefix("ret=") {
+                ret = Some(v.parse().unwrap());
+            } else if let Some(v) = field.strip_prefix("errno=") {
+                errno = Some(v.parse().unwrap());
+            }
+        }
+        (ret.unwrap(), errno.unwrap())
+    }
+
+    // --- Unix-socket escape (audit C1) -----------------------------------
+
+    #[tokio::test]
+    async fn connecting_to_an_outside_unix_socket_is_blocked_by_default() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        let socket_path = outside.path().join("bus.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &helper_read_paths(), &[], true);
+
+        let (ret, errno) =
+            run_helper(&confiner, "unix_connect", socket_path.to_str().unwrap()).await;
+
+        assert!(ret < 0, "connect to an outside Unix socket must fail");
+        assert_eq!(errno, libc::EPERM, "blocked at socket(AF_UNIX) by seccomp");
+    }
+
+    #[tokio::test]
+    async fn socketpair_still_works_when_unix_sockets_are_blocked() {
+        let dir = fixture_dir();
+        let confiner = LandlockConfiner::new(dir.path(), &helper_read_paths(), &[], true);
+
+        let (ret, errno) = run_helper(&confiner, "socketpair", "").await;
+
+        assert_eq!(ret, 0, "socketpair failed with errno {errno}");
+    }
+
+    #[tokio::test]
+    async fn allow_unix_sockets_opts_out_of_the_block() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        let socket_path = outside.path().join("bus.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let options = crate::ConfineOptions::new()
+            .require_enforcement(true)
+            .allow_unix_sockets(true);
+        let confiner =
+            LandlockConfiner::with_options(dir.path(), &helper_read_paths(), &[], options);
+
+        let (ret, errno) =
+            run_helper(&confiner, "unix_connect", socket_path.to_str().unwrap()).await;
+
+        assert_eq!(ret, 0, "opted-out connect failed with errno {errno}");
+    }
+
+    #[tokio::test]
+    async fn session_ipc_environment_variables_are_scrubbed() {
+        let dir = fixture_dir();
+        let confiner = confiner_for(dir.path());
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "echo \"[$DBUS_SESSION_BUS_ADDRESS$XDG_RUNTIME_DIR$SSH_AUTH_SOCK\
+             $GPG_AGENT_INFO$WAYLAND_DISPLAY$DISPLAY]\"",
+        ]);
+        for var in SCRUBBED_ENV_VARS {
+            command.env(var, "leaked");
+        }
+
+        let (success, output) = run(confiner.confine(command)).await;
+
+        assert!(success, "command failed: {output}");
+        assert_eq!(output.trim(), "[]");
     }
 
     #[tokio::test]
