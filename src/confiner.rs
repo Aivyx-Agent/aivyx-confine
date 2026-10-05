@@ -5,12 +5,15 @@
 //! for the policy rationale (informed by, but deliberately not identical
 //! to, Codex CLI's current bubblewrap-based sandbox).
 
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
-    Scope, path_beneath_rules,
+    ABI, Access, AccessFs, PathBeneath, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    RulesetStatus, Scope,
 };
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -38,7 +41,7 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 /// the one grant that can't stay narrow (the working directory, which must
 /// be granted wholesale to be useful), `grant_paths_excluding` below does
 /// the carve-out properly instead of ignoring the problem.
-/// Nonexistent paths are silently skipped by `path_beneath_rules`, so it's
+/// Nonexistent paths are silently skipped by `Grants::push_root`, so it's
 /// safe to list toolchain paths that may not exist on a given system.
 const DEFAULT_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
@@ -457,9 +460,9 @@ impl LandlockConfiner {
         }
         // Read side of the device grants below (read and write rules are
         // separate Landlock rule sets, so both lists need the entries).
-        read_grants
-            .full
-            .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
+        for device in DEVICE_RW_PATHS {
+            read_grants.push_root(Path::new(device));
+        }
 
         let mut write_candidates = vec![cwd.clone()];
         match &self.tmp {
@@ -477,11 +480,11 @@ impl LandlockConfiner {
             grant_paths_excluding(root, &resolved_deny_paths, &mut write_grants);
         }
         // Individual device files, not subject to deny_paths carve-outs
-        // (they're fixed, well-known, and content-free); `path_beneath_rules`
-        // silently skips any that don't exist.
-        write_grants
-            .full
-            .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
+        // (they're fixed, well-known, and content-free); `push_root` silently
+        // skips any that don't exist.
+        for device in DEVICE_RW_PATHS {
+            write_grants.push_root(Path::new(device));
+        }
 
         (read_grants, write_grants)
     }
@@ -492,8 +495,10 @@ impl LandlockConfiner {
     /// forked child under async-signal-safety constraints (no allocation,
     /// no locks). `RulesetCreated::restrict_self()` itself is verified to
     /// be a thin syscall wrapper over this already-built state.
-    fn build_ruleset(&self) -> Result<RulesetCreated, landlock::RulesetError> {
-        let (read_grants, write_grants) = self.compute_grants();
+    fn build_ruleset(
+        read_grants: &Grants,
+        write_grants: &Grants,
+    ) -> Result<RulesetCreated, landlock::RulesetError> {
         Ruleset::default()
             .handle_access(AccessFs::from_all(LANDLOCK_ABI))?
             // Signals and abstract Unix sockets may not cross the sandbox
@@ -504,20 +509,37 @@ impl LandlockConfiner {
             // (best-effort compatibility, as for every other right).
             .scope(Scope::from_all(LANDLOCK_ABI))?
             .create()?
-            .add_rules(path_beneath_rules(
+            .add_rules(fd_rules(
                 &read_grants.full,
                 AccessFs::from_read(LANDLOCK_ABI),
             ))?
-            .add_rules(path_beneath_rules(&read_grants.dir_only, AccessFs::ReadDir))?
-            .add_rules(path_beneath_rules(
+            .add_rules(fd_rules(&read_grants.dir_only, AccessFs::ReadDir.into()))?
+            .add_rules(fd_rules(
                 &write_grants.full,
                 AccessFs::from_all(LANDLOCK_ABI),
             ))?
-            .add_rules(path_beneath_rules(
+            .add_rules(fd_rules(
                 &write_grants.dir_only,
                 carved_out_dir_write_access(),
             ))
     }
+}
+
+/// Landlock rules for `grants`, built from their already-open fds.
+/// Non-directories get only the file subset of `access` (Landlock rejects
+/// directory rights on a file).
+fn fd_rules(
+    grants: &[Grant],
+    access: landlock::BitFlags<AccessFs>,
+) -> impl Iterator<Item = Result<PathBeneath<BorrowedFd<'_>>, landlock::RulesetError>> {
+    grants.iter().map(move |grant| {
+        let access = if grant.is_dir {
+            access
+        } else {
+            access & AccessFs::from_file(LANDLOCK_ABI)
+        };
+        Ok(PathBeneath::new(grant.fd.as_fd(), access))
+    })
 }
 
 /// Grants computed for one access level (read, or read+write).
@@ -527,10 +549,135 @@ impl LandlockConfiner {
 /// create entries), never file rights, because file rights
 /// on a directory would apply to every file beneath it — including the
 /// denied one.
-#[derive(Debug, Default, PartialEq, Eq)]
+///
+/// Every grant holds the fd it was opened through, and the ruleset is
+/// built from those fds (`PathBeneath::new(fd, ..)`), never by resolving
+/// `path` again: a confined racer can swap an entry for a symlink between
+/// enumeration and ruleset construction, and a by-path reopen would then
+/// attach the rule to the symlink's target. `path` is only a label (for
+/// deny matching and tests).
+#[derive(Debug, Default)]
 struct Grants {
-    full: Vec<PathBuf>,
-    dir_only: Vec<PathBuf>,
+    full: Vec<Grant>,
+    dir_only: Vec<Grant>,
+}
+
+#[derive(Debug)]
+struct Grant {
+    /// A label only (see `Grants`); read by `Debug` output and tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    path: PathBuf,
+    fd: OwnedFd,
+    is_dir: bool,
+}
+
+impl Grants {
+    /// Grants `path` whole, resolving it (following symlinks) — only for
+    /// the fixed roots handed in by the consumer or this crate, never for
+    /// an enumerated child.
+    fn push_root(&mut self, path: &Path) {
+        if let Some(fd) = open_path(path, libc::O_PATH | libc::O_CLOEXEC) {
+            let is_dir = fd_is_dir(fd.as_fd());
+            self.full.push(Grant {
+                path: path.to_path_buf(),
+                fd,
+                is_dir,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn full_paths(&self) -> Vec<PathBuf> {
+        self.full.iter().map(|g| g.path.clone()).collect()
+    }
+}
+
+fn cstring(bytes: &[u8]) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(bytes).ok()
+}
+
+/// `open(path, flags)`; `None` on any failure.
+fn open_path(path: &Path, flags: libc::c_int) -> Option<OwnedFd> {
+    let path = cstring(path.as_os_str().as_bytes())?;
+    // SAFETY: valid NUL-terminated path; the returned fd is owned below.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    // SAFETY: `fd` is a freshly opened descriptor nobody else owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `openat(dir, name, flags)` for a single path component; `None` on any
+/// failure. With `O_NOFOLLOW` nothing is resolved through a symlink.
+fn open_at(dir: BorrowedFd<'_>, name: &OsStr, flags: libc::c_int) -> Option<OwnedFd> {
+    let name = cstring(name.as_bytes())?;
+    // SAFETY: valid dirfd and NUL-terminated name; the fd is owned below.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    // SAFETY: `fd` is a freshly opened descriptor nobody else owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens a directory entry of `dir` as a directory to read, refusing
+/// symlinks.
+fn open_subdir(dir: BorrowedFd<'_>, name: &OsStr) -> Option<OwnedFd> {
+    open_at(
+        dir,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+}
+
+fn fd_stat(fd: BorrowedFd<'_>) -> Option<libc::stat> {
+    // SAFETY: `stat` is plain old data and fully written on success.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and out-pointer.
+    (unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0).then_some(st)
+}
+
+fn fd_is_dir(fd: BorrowedFd<'_>) -> bool {
+    fd_stat(fd).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+}
+
+/// The entries of the directory open on `dir` (minus `.`/`..`), with
+/// their `d_type` (`DT_UNKNOWN` on filesystems that don't report it).
+fn dir_entries(dir: BorrowedFd<'_>) -> Vec<(OsString, u8)> {
+    // SAFETY: duplicating a valid fd; ownership passes to `fdopendir`.
+    let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Vec::new();
+    }
+    // SAFETY: `dup` is a valid directory fd we own.
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed, so `dup` is still ours to close.
+        unsafe { libc::close(dup) };
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    // SAFETY: `stream` is a valid DIR*; the dup shares its offset with
+    // `dir`, so start from the beginning explicitly.
+    unsafe { libc::rewinddir(stream) };
+    loop {
+        // SAFETY: `stream` is valid; the entry is copied out before the
+        // next `readdir` call.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated per readdir(3).
+        let (name, d_type) = unsafe {
+            (
+                std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()),
+                (*entry).d_type,
+            )
+        };
+        let name = name.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        entries.push((OsStr::from_bytes(name).to_os_string(), d_type));
+    }
+    // SAFETY: closes the stream and `dup` with it.
+    unsafe { libc::closedir(stream) };
+    entries
 }
 
 /// Directory-level rights for a carved-out directory in the write set:
@@ -573,44 +720,70 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grant
     if deny_paths.iter().any(|denied| denied == root) {
         return;
     }
-    let relevant: Vec<&PathBuf> = deny_paths
-        .iter()
-        .filter(|denied| denied.starts_with(root))
-        .collect();
-    if relevant.is_empty() {
-        grants.full.push(root.to_path_buf());
+    if !deny_paths.iter().any(|denied| denied.starts_with(root)) {
+        grants.push_root(root);
         return;
     }
-
     // Can't enumerate what's inside `root` — fail toward less access, not
     // more, rather than granting a directory whose contents are unknown.
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) else {
         return;
     };
-    grants.dir_only.push(root.to_path_buf());
-    for entry in entries.flatten() {
-        let child = entry.path();
+    grant_dir_excluding(root, dir, deny_paths, grants);
+}
+
+/// The enumerating half of `grant_paths_excluding`, for a directory
+/// already open on `dir`. Every child is opened relative to `dir` with
+/// `O_NOFOLLOW`, so no path is resolved twice and no symlink is followed:
+/// a symlink entry is never granted (granting `docs -> /` would hand out
+/// the whole filesystem, because Landlock attaches the rule to the
+/// target), and an entry swapped for a symlink mid-walk is either seen as
+/// the symlink (skipped) or as the original inode (granted as that
+/// inode). Skipping symlinks costs nothing legitimate: Landlock checks the
+/// resolved path, so a symlink whose target is inside some other grant
+/// still works through that grant. An entry that can't be opened or
+/// stat'ed is skipped (fail toward less access).
+fn grant_dir_excluding(path: &Path, dir: OwnedFd, deny_paths: &[PathBuf], grants: &mut Grants) {
+    let relevant: Vec<&PathBuf> = deny_paths
+        .iter()
+        .filter(|denied| denied.starts_with(path))
+        .collect();
+    for (name, _) in dir_entries(dir.as_fd()) {
+        let child = path.join(&name);
         if relevant.iter().any(|denied| **denied == child) {
             continue;
         }
-        // Never grant a symlink entry. `path_beneath_rules` opens each
-        // grant following symlinks and Landlock attaches the rule to the
-        // *target* inode, so granting `docs -> /` here would hand out
-        // read+write on the whole filesystem. Skipping costs nothing
-        // legitimate: Landlock checks the resolved path, so a symlink
-        // whose target is inside some other grant still works through
-        // that grant. An entry whose type can't be read is skipped too
-        // (fail toward less access).
-        match entry.file_type() {
-            Ok(file_type) if !file_type.is_symlink() => {}
-            _ => continue,
-        }
         if relevant.iter().any(|denied| denied.starts_with(&child)) {
-            grant_paths_excluding(&child, deny_paths, grants);
-        } else {
-            grants.full.push(child);
+            if let Some(subdir) = open_subdir(dir.as_fd(), &name) {
+                grant_dir_excluding(&child, subdir, deny_paths, grants);
+            }
+            continue;
         }
+        let Some(fd) = open_at(
+            dir.as_fd(),
+            &name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) else {
+            continue;
+        };
+        let Some(st) = fd_stat(fd.as_fd()) else {
+            continue;
+        };
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            continue;
+        }
+        grants.full.push(Grant {
+            path: child,
+            fd,
+            is_dir: kind == libc::S_IFDIR,
+        });
     }
+    grants.dir_only.push(Grant {
+        path: path.to_path_buf(),
+        fd: dir,
+        is_dir: true,
+    });
 }
 
 fn canonical_or_given(path: &Path) -> PathBuf {
@@ -629,30 +802,50 @@ fn multiply_linked_inodes(deny_paths: &[PathBuf]) -> std::collections::HashSet<(
         .collect()
 }
 
-/// Appends every regular file under `dir` (not following symlinks, and
+/// Appends every regular file under `root` (not following symlinks, and
 /// including `.git`) whose `(dev, ino)` is in `inodes`. Paths already in
-/// `out` are appended again harmlessly.
+/// `out` are appended again harmlessly. Uncached: a full walk of the root
+/// on every spawn, but only while some denied file has more than one
+/// link.
 fn find_hardlink_aliases(
-    dir: &Path,
+    root: &Path,
     inodes: &std::collections::HashSet<(u64, u64)>,
     out: &mut Vec<PathBuf>,
 ) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
+    if let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) {
+        find_hardlink_aliases_in(root, dir.as_fd(), inodes, out);
+    }
+}
+
+fn find_hardlink_aliases_in(
+    path: &Path,
+    dir: BorrowedFd<'_>,
+    inodes: &std::collections::HashSet<(u64, u64)>,
+    out: &mut Vec<PathBuf>,
+) {
+    for (name, d_type) in dir_entries(dir) {
+        if matches!(d_type, libc::DT_DIR | libc::DT_UNKNOWN)
+            && let Some(subdir) = open_subdir(dir, &name)
+        {
+            find_hardlink_aliases_in(&path.join(&name), subdir.as_fd(), inodes, out);
+            continue;
+        }
+        if !matches!(d_type, libc::DT_REG | libc::DT_UNKNOWN) {
+            continue;
+        }
+        let Some(fd) = open_at(
+            dir,
+            &name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) else {
             continue;
         };
-        if file_type.is_dir() {
-            find_hardlink_aliases(&entry.path(), inodes, out);
-        } else if file_type.is_file()
-            && let Ok(meta) = entry.metadata()
-            && meta.nlink() > 1
-            && inodes.contains(&(meta.dev(), meta.ino()))
+        if let Some(st) = fd_stat(fd.as_fd())
+            && st.st_mode & libc::S_IFMT == libc::S_IFREG
+            && st.st_nlink > 1
+            && inodes.contains(&(st.st_dev, st.st_ino))
         {
-            out.push(entry.path());
+            out.push(path.join(&name));
         }
     }
 }
@@ -697,7 +890,8 @@ struct DirScan {
     ino: u64,
     mtime: (i64, i64),
     matches: Vec<PathBuf>,
-    subdirs: Vec<PathBuf>,
+    /// Names of entries that may be directories to descend into.
+    subdirs: Vec<OsString>,
 }
 
 type ScanCache = std::collections::HashMap<PathBuf, DirScan>;
@@ -724,73 +918,80 @@ const SCAN_CACHE_SETTLE_SECS: i64 = 2;
 /// containing directory child-by-child, so a project with many matching
 /// files produces a larger Landlock ruleset.
 fn walk_for_basename_matches(
-    dir: &Path,
+    root: &Path,
     patterns: &globset::GlobSet,
     prev: &mut ScanCache,
     next: &mut ScanCache,
     matches: &mut Vec<PathBuf>,
 ) {
-    use std::os::unix::fs::MetadataExt;
+    if let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) {
+        walk_dir_for_basename_matches(root, dir.as_fd(), patterns, prev, next, matches);
+    }
+}
 
-    let Ok(meta) = std::fs::metadata(dir) else {
+fn walk_dir_for_basename_matches(
+    path: &Path,
+    dir: BorrowedFd<'_>,
+    patterns: &globset::GlobSet,
+    prev: &mut ScanCache,
+    next: &mut ScanCache,
+    matches: &mut Vec<PathBuf>,
+) {
+    let Some(st) = fd_stat(dir) else {
         return;
     };
-    let mtime = (meta.mtime(), meta.mtime_nsec());
-    if let Some(cached) = prev.remove(dir)
-        && cached.dev == meta.dev()
-        && cached.ino == meta.ino()
-        && cached.mtime == mtime
-    {
-        matches.extend(cached.matches.iter().cloned());
-        for subdir in &cached.subdirs {
-            walk_for_basename_matches(subdir, patterns, prev, next, matches);
+    let mtime = (st.st_mtime, st.st_mtime_nsec);
+    let scan = match prev.remove(path) {
+        Some(cached)
+            if cached.dev == st.st_dev && cached.ino == st.st_ino && cached.mtime == mtime =>
+        {
+            cached
         }
-        next.insert(dir.to_path_buf(), cached);
-        return;
-    }
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        _ => {
+            let mut scan = DirScan {
+                dev: st.st_dev,
+                ino: st.st_ino,
+                mtime,
+                matches: Vec::new(),
+                subdirs: Vec::new(),
+            };
+            for (name, d_type) in dir_entries(dir) {
+                if patterns.is_match(Path::new(&name)) {
+                    scan.matches.push(path.join(&name));
+                    continue; // matched — no need to recurse further into it
+                }
+                // `.git` directories never legitimately hold a project's
+                // own secrets — they hold git's object database and refs —
+                // so skipping them cuts real walk cost without weakening
+                // the guarantee this scan exists for.
+                if matches!(d_type, libc::DT_DIR | libc::DT_UNKNOWN) && name != ".git" {
+                    scan.subdirs.push(name);
+                }
+            }
+            scan
+        }
     };
-    let mut own_matches = Vec::new();
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if patterns.is_match(Path::new(&name)) {
-            own_matches.push(entry.path());
-            continue; // matched — no need to recurse further into it
-        }
-        // `file_type()` reflects the entry itself, not a symlink's
-        // target, so a symlinked directory is never recursed into —
-        // this is what keeps a symlink cycle from causing unbounded
-        // recursion here.
-        //
-        // `.git` directories never legitimately hold a project's own
-        // secrets — they hold git's own internal object database and
-        // refs — so skipping them cuts real walk cost without weakening
-        // the guarantee this scan exists for.
-        if entry.file_type().is_ok_and(|ft| ft.is_dir()) && name != ".git" {
-            subdirs.push(entry.path());
+    matches.extend(scan.matches.iter().cloned());
+    // Subdirectories are opened relative to `dir` with `O_NOFOLLOW`, so a
+    // symlinked directory (or one swapped in mid-walk) is never followed —
+    // which also keeps a symlink cycle from causing unbounded recursion.
+    for name in &scan.subdirs {
+        if let Some(subdir) = open_subdir(dir, name) {
+            walk_dir_for_basename_matches(
+                &path.join(name),
+                subdir.as_fd(),
+                patterns,
+                prev,
+                next,
+                matches,
+            );
         }
     }
-    matches.extend(own_matches.iter().cloned());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     if now - mtime.0 >= SCAN_CACHE_SETTLE_SECS {
-        next.insert(
-            dir.to_path_buf(),
-            DirScan {
-                dev: meta.dev(),
-                ino: meta.ino(),
-                mtime,
-                matches: own_matches,
-                subdirs: subdirs.clone(),
-            },
-        );
-    }
-    for subdir in &subdirs {
-        walk_for_basename_matches(subdir, patterns, prev, next, matches);
+        next.insert(path.to_path_buf(), scan);
     }
 }
 
@@ -932,7 +1133,21 @@ fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
 }
 
 impl ExecutionConfiner for LandlockConfiner {
-    fn confine(&self, mut command: tokio::process::Command) -> tokio::process::Command {
+    fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
+        let (read_grants, write_grants) = self.compute_grants();
+        self.confine_with_grants(command, &read_grants, &write_grants)
+    }
+}
+
+impl LandlockConfiner {
+    /// `confine` with the grants already computed — split out so tests
+    /// can change the filesystem between computing and applying them.
+    fn confine_with_grants(
+        &self,
+        mut command: tokio::process::Command,
+        read_grants: &Grants,
+        write_grants: &Grants,
+    ) -> tokio::process::Command {
         let require_enforcement = self.require_enforcement;
         for var in SCRUBBED_ENV_VARS {
             command.env_remove(var);
@@ -949,7 +1164,7 @@ impl ExecutionConfiner for LandlockConfiner {
             };
         }
 
-        let built = self.build_ruleset().map_err(|err| err.to_string());
+        let built = Self::build_ruleset(read_grants, write_grants).map_err(|err| err.to_string());
         #[cfg(test)]
         let built = if self.force_ruleset_failure {
             Err("forced by test".to_string())
@@ -1373,6 +1588,32 @@ mod tests {
         );
         let (success, output) = run(confiner.confine(command)).await;
         assert!(!success, "read through certs/root must fail: {output}");
+        assert!(!output.contains("top secret"));
+    }
+
+    // --- Grants are bound to inodes, not re-resolved paths (review C2) --
+
+    #[tokio::test]
+    async fn swapping_a_granted_entry_for_a_symlink_after_grant_computation_grants_nothing() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        // Grants are computed while `docs` is a real directory; a racer
+        // then swaps it for a symlink before the ruleset is built.
+        let (read_grants, write_grants) = confiner.compute_grants();
+        std::fs::rename(dir.path().join("docs"), dir.path().join("docs_real")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("docs")).unwrap();
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join("docs/secret.txt"));
+        let command = confiner.confine_with_grants(command, &read_grants, &write_grants);
+        let (success, output) = run(command).await;
+
+        assert!(!success, "read through the swapped-in symlink must fail");
         assert!(!output.contains("top secret"));
     }
 
@@ -2027,7 +2268,7 @@ mod tests {
         let dir = fixture_dir();
         let mut grants = Grants::default();
         grant_paths_excluding(dir.path(), &[], &mut grants);
-        assert_eq!(grants.full, vec![dir.path().to_path_buf()]);
+        assert_eq!(grants.full_paths(), vec![dir.path().to_path_buf()]);
         assert!(grants.dir_only.is_empty());
     }
 
@@ -2036,7 +2277,7 @@ mod tests {
         let dir = fixture_dir();
         let mut grants = Grants::default();
         grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()], &mut grants);
-        assert_eq!(grants, Grants::default());
+        assert!(grants.full.is_empty() && grants.dir_only.is_empty());
     }
 
     #[test]
