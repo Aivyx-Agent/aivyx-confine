@@ -371,7 +371,32 @@ impl LandlockConfiner {
         // `grant_paths_excluding` call is safe, not overly permissive —
         // that function only ever acts on entries actually nested under
         // the specific root it's given.
-        let mut resolved_deny_paths = self.deny_paths.clone();
+        // Carve-outs match lexically (`Path::starts_with`), so roots and
+        // deny entries are compared in canonical form: a non-canonical
+        // `cwd` (reached through a symlink) or a deny entry given through
+        // a symlink would otherwise silently match nothing. Relative
+        // multi-component entries (`config/secrets.json`) are taken
+        // relative to `cwd`. Both the given and the canonical form of each
+        // entry are kept; the extra one is harmless.
+        let cwd = canonical_or_given(&self.cwd);
+        let extra_read_paths: Vec<PathBuf> = self
+            .extra_read_paths
+            .iter()
+            .map(|p| canonical_or_given(p))
+            .collect();
+        let mut resolved_deny_paths = Vec::with_capacity(self.deny_paths.len() * 2);
+        for entry in &self.deny_paths {
+            let absolute = if entry.is_relative() {
+                cwd.join(entry)
+            } else {
+                entry.clone()
+            };
+            let canonical = canonical_or_given(&absolute);
+            if canonical != absolute {
+                resolved_deny_paths.push(canonical);
+            }
+            resolved_deny_paths.push(absolute);
+        }
         // Credential stores inside the home read grants are always carved
         // out, whatever the consumer's own deny list says. Only existing
         // ones: a missing one needs no carve-out, and if it appears later
@@ -392,7 +417,7 @@ impl LandlockConfiner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut next = ScanCache::new();
-            for root in std::iter::once(&self.cwd).chain(&self.extra_read_paths) {
+            for root in std::iter::once(&cwd).chain(&extra_read_paths) {
                 walk_for_basename_matches(
                     root,
                     patterns,
@@ -411,7 +436,7 @@ impl LandlockConfiner {
         // than one link, which is rare.
         let linked_inodes = multiply_linked_inodes(&resolved_deny_paths);
         if !linked_inodes.is_empty() {
-            for root in std::iter::once(&self.cwd).chain(&self.extra_read_paths) {
+            for root in std::iter::once(&cwd).chain(&extra_read_paths) {
                 find_hardlink_aliases(root, &linked_inodes, &mut resolved_deny_paths);
             }
         }
@@ -424,8 +449,8 @@ impl LandlockConfiner {
         if let Some(home) = &self.home {
             read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
         }
-        read_candidates.push(self.cwd.clone());
-        read_candidates.extend(self.extra_read_paths.iter().cloned());
+        read_candidates.push(cwd.clone());
+        read_candidates.extend(extra_read_paths.iter().cloned());
         let mut read_grants = Grants::default();
         for root in &read_candidates {
             grant_paths_excluding(root, &resolved_deny_paths, &mut read_grants);
@@ -436,7 +461,7 @@ impl LandlockConfiner {
             .full
             .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let mut write_candidates = vec![self.cwd.clone()];
+        let mut write_candidates = vec![cwd.clone()];
         match &self.tmp {
             TmpPolicy::Shared => {
                 write_candidates.push(std::env::temp_dir());
@@ -582,6 +607,10 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grant
             grants.full.push(child);
         }
     }
+}
+
+fn canonical_or_given(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `(dev, ino)` of every denied regular file that has more than one hard
@@ -1631,6 +1660,49 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(gone, "background sleep survived kill_process_group");
+    }
+
+    // --- Deny-path normalisation (audit M3) -----------------------------
+
+    #[tokio::test]
+    async fn a_relative_multi_component_deny_entry_is_resolved_against_cwd() {
+        let dir = fixture_dir();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/secrets.json"), "{}").unwrap();
+        let confiner = LandlockConfiner::new(
+            dir.path(),
+            &[],
+            &[PathBuf::from("config/secrets.json")],
+            true,
+        );
+
+        assert!(!cat_succeeds(&confiner, &dir.path().join("config/secrets.json")).await);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_cwd_still_honours_a_canonical_deny_entry() {
+        let dir = fixture_dir();
+        let links = fixture_dir();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "SECRET").unwrap();
+        let link = links.path().join("project");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let confiner = LandlockConfiner::new(&link, &[], std::slice::from_ref(&secret), true);
+
+        assert!(!cat_succeeds(&confiner, &secret).await);
+        assert!(!cat_succeeds(&confiner, &link.join("secret.txt")).await);
+    }
+
+    #[tokio::test]
+    async fn a_deny_entry_given_through_a_symlink_is_honoured() {
+        let dir = fixture_dir();
+        let links = fixture_dir();
+        std::fs::write(dir.path().join("secret.txt"), "SECRET").unwrap();
+        let link = links.path().join("project");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[link.join("secret.txt")], true);
+
+        assert!(!cat_succeeds(&confiner, &dir.path().join("secret.txt")).await);
     }
 
     // --- Seccomp without Landlock (audit M2) ----------------------------
