@@ -190,8 +190,8 @@ pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &[
 ];
 
 pub struct LandlockConfiner {
-    read_paths: Vec<PathBuf>,
-    write_paths: Vec<PathBuf>,
+    read_grants: Grants,
+    write_grants: Grants,
     seccomp_program: BpfProgram,
     require_enforcement: bool,
 }
@@ -273,32 +273,36 @@ impl LandlockConfiner {
         }
         read_candidates.push(cwd.to_path_buf());
         read_candidates.extend(extra_read_paths.iter().cloned());
-        let mut read_paths: Vec<PathBuf> = read_candidates
-            .iter()
-            .flat_map(|root| grant_paths_excluding(root, &resolved_deny_paths))
-            .collect();
+        let mut read_grants = Grants::default();
+        for root in &read_candidates {
+            grant_paths_excluding(root, &resolved_deny_paths, &mut read_grants);
+        }
         // Read side of the device grants below (read and write rules are
         // separate Landlock rule sets, so both lists need the entries).
-        read_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
+        read_grants
+            .full
+            .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
         let mut write_candidates = vec![cwd.to_path_buf(), std::env::temp_dir()];
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             write_candidates.push(PathBuf::from(tmpdir));
         }
-        let mut write_paths: Vec<PathBuf> = write_candidates
-            .iter()
-            .flat_map(|root| grant_paths_excluding(root, &resolved_deny_paths))
-            .collect();
+        let mut write_grants = Grants::default();
+        for root in &write_candidates {
+            grant_paths_excluding(root, &resolved_deny_paths, &mut write_grants);
+        }
         // Individual device files, not subject to deny_paths carve-outs
         // (they're fixed, well-known, and content-free); `path_beneath_rules`
         // silently skips any that don't exist.
-        write_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
+        write_grants
+            .full
+            .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
         let seccomp_program = build_seccomp_filter(&options);
 
         Self {
-            read_paths,
-            write_paths,
+            read_grants,
+            write_grants,
             seccomp_program,
             require_enforcement,
         }
@@ -315,14 +319,58 @@ impl LandlockConfiner {
             .handle_access(AccessFs::from_all(LANDLOCK_ABI))?
             .create()?
             .add_rules(path_beneath_rules(
-                &self.read_paths,
+                &self.read_grants.full,
                 AccessFs::from_read(LANDLOCK_ABI),
             ))?
             .add_rules(path_beneath_rules(
-                &self.write_paths,
+                &self.read_grants.dir_only,
+                AccessFs::ReadDir,
+            ))?
+            .add_rules(path_beneath_rules(
+                &self.write_grants.full,
                 AccessFs::from_all(LANDLOCK_ABI),
+            ))?
+            .add_rules(path_beneath_rules(
+                &self.write_grants.dir_only,
+                carved_out_dir_write_access(),
             ))
     }
+}
+
+/// Grants computed for one access level (read, or read+write).
+/// `full` paths get that level's whole access set beneath them.
+/// `dir_only` paths are directories that had to be enumerated to carve a
+/// denied entry out of them: they get only directory-level rights (list,
+/// create, remove, rename within), never file rights, because file rights
+/// on a directory would apply to every file beneath it — including the
+/// denied one.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Grants {
+    full: Vec<PathBuf>,
+    dir_only: Vec<PathBuf>,
+}
+
+/// Directory-level rights for a carved-out directory in the write set:
+/// list it, create entries in it, remove entries from it, and rename
+/// across it (`Refer`). None of these reads or writes file *contents*, so
+/// the denied file stays unreadable and unwritable. Two consequences are
+/// accepted and documented: an entry can be deleted or renamed even when
+/// it is denied (`rm .env` works; reading it still doesn't), and a file
+/// or directory *newly created* directly in a carved-out directory has no
+/// file rights, because no rule covers its inode — until the grants are
+/// next computed. `Refer` cannot be
+/// used to launder a denied file into a granted directory: Landlock
+/// refuses any link/rename through which the file would gain rights.
+fn carved_out_dir_write_access() -> landlock::BitFlags<AccessFs> {
+    AccessFs::ReadDir
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::MakeSym
+        | AccessFs::MakeFifo
+        | AccessFs::MakeSock
+        | AccessFs::RemoveDir
+        | AccessFs::RemoveFile
+        | AccessFs::Refer
 }
 
 /// Landlock has no negative/deny rule — a domain can only ever be *more*
@@ -330,27 +378,29 @@ impl LandlockConfiner {
 /// wholesale while still excluding a `deny_paths` entry nested somewhere
 /// inside it, enumerate `root`'s direct children and grant each
 /// individually: recurse into any child that itself contains a denial
-/// further down, and skip entirely any child that *is* a denial. When
-/// nothing under `root` is denied (the common case), this returns `root`
-/// unchanged with no extra filesystem work.
-fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
+/// further down, and skip entirely any child that *is* a denial. The
+/// enumerated directory itself goes into `grants.dir_only` (see `Grants`).
+/// When nothing under `root` is denied (the common case), `root` is
+/// granted whole with no extra filesystem work.
+fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grants) {
     if deny_paths.iter().any(|denied| denied == root) {
-        return Vec::new();
+        return;
     }
     let relevant: Vec<&PathBuf> = deny_paths
         .iter()
         .filter(|denied| denied.starts_with(root))
         .collect();
     if relevant.is_empty() {
-        return vec![root.to_path_buf()];
+        grants.full.push(root.to_path_buf());
+        return;
     }
 
     // Can't enumerate what's inside `root` — fail toward less access, not
     // more, rather than granting a directory whose contents are unknown.
     let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
+        return;
     };
-    let mut grants = Vec::new();
+    grants.dir_only.push(root.to_path_buf());
     for entry in entries.flatten() {
         let child = entry.path();
         if relevant.iter().any(|denied| **denied == child) {
@@ -369,12 +419,11 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
             _ => continue,
         }
         if relevant.iter().any(|denied| denied.starts_with(&child)) {
-            grants.extend(grant_paths_excluding(&child, deny_paths));
+            grant_paths_excluding(&child, deny_paths, grants);
         } else {
-            grants.push(child);
+            grants.full.push(child);
         }
     }
-    grants
 }
 
 /// Recursively finds every path under `root` whose basename matches a
@@ -843,6 +892,53 @@ mod tests {
         assert!(!output.contains("top secret"));
     }
 
+    // --- Directory operations in a carved-out directory (audit I1) ------
+
+    #[tokio::test]
+    async fn a_carved_out_root_stays_listable_and_its_entries_manageable() {
+        let dir = fixture_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(dir.path()).args([
+            "-c",
+            "ls . && touch newfile && mkdir newdir && rm Cargo.toml && mv src src2",
+        ]);
+        let (success, output) = run(confiner.confine(command)).await;
+        assert!(success, "directory operations in the root failed: {output}");
+        assert!(dir.path().join("newfile").exists());
+        assert!(dir.path().join("newdir").is_dir());
+        assert!(!dir.path().join("Cargo.toml").exists());
+        assert!(dir.path().join("src2").is_dir());
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join(".env"));
+        let (success, output) = run(confiner.confine(command)).await;
+        assert!(!success, "the denied file must stay unreadable");
+        assert!(!output.contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn a_denied_file_cannot_be_moved_into_a_granted_subdirectory() {
+        let dir = fixture_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .current_dir(dir.path())
+            .args(["-c", "mv .env src/x || ln .env src/y; cat src/x src/y"]);
+        let (_, output) = run(confiner.confine(command)).await;
+        assert!(
+            !output.contains("SECRET"),
+            "denied content leaked: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn write_inside_the_granted_root_succeeds() {
         let dir = fixture_dir();
@@ -958,15 +1054,18 @@ mod tests {
     #[test]
     fn grant_paths_excluding_returns_root_unchanged_when_nothing_is_denied() {
         let dir = fixture_dir();
-        let grants = grant_paths_excluding(dir.path(), &[]);
-        assert_eq!(grants, vec![dir.path().to_path_buf()]);
+        let mut grants = Grants::default();
+        grant_paths_excluding(dir.path(), &[], &mut grants);
+        assert_eq!(grants.full, vec![dir.path().to_path_buf()]);
+        assert!(grants.dir_only.is_empty());
     }
 
     #[test]
     fn grant_paths_excluding_returns_empty_when_root_itself_is_denied() {
         let dir = fixture_dir();
-        let grants = grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()]);
-        assert!(grants.is_empty());
+        let mut grants = Grants::default();
+        grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()], &mut grants);
+        assert_eq!(grants, Grants::default());
     }
 
     #[test]
