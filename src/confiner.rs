@@ -258,6 +258,12 @@ impl TmpPolicy {
 /// since `id()` returns `None` once the child has been reaped. A group
 /// that no longer exists is not an error. `pgid` 0 (which would mean
 /// "the caller's own group") and values beyond `pid_t` are rejected.
+///
+/// Call it promptly. The kernel never hands out a pid that is still in
+/// use as a process-group id, but once *every* member of the group has
+/// exited the number is free again, so a much later call could hit an
+/// unrelated group. Killing as soon as the tool call ends (or right after
+/// the leader is reaped) keeps that window negligible.
 pub fn kill_process_group(pgid: u32) -> io::Result<()> {
     let pgid = libc::pid_t::try_from(pgid)
         .ok()

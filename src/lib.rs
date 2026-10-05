@@ -10,6 +10,15 @@ mod confiner;
 #[cfg(feature = "sandbox-backend")]
 pub use confiner::{LandlockConfiner, kill_process_group};
 
+/// Without the `sandbox-backend` feature only `NoopConfiner` exists, and it
+/// never creates a process group, so there is never a group to kill: this
+/// does nothing and returns `Ok(())`. It exists so consumers can call
+/// `kill_process_group` unconditionally instead of `cfg`-gating the call.
+#[cfg(not(feature = "sandbox-backend"))]
+pub fn kill_process_group(_pgid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Wraps/restricts an about-to-spawn process before it execs.
 /// `NoopConfiner` is the identity fallback (for platforms/kernels without
 /// Landlock, or with `sandbox-backend` disabled at build time);
@@ -207,6 +216,14 @@ pub fn default_confiner_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_process_group_is_available_in_every_build() {
+        // Built either way: with the backend it targets a real group,
+        // without it there is never a group to kill. A pgid that can't
+        // exist must not be an error in either build.
+        assert!(kill_process_group(i32::MAX as u32).is_ok());
+    }
 
     #[test]
     fn confine_options_default_to_the_strict_policy() {
