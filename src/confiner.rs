@@ -524,7 +524,7 @@ impl LandlockConfiner {
 /// `full` paths get that level's whole access set beneath them.
 /// `dir_only` paths are directories that had to be enumerated to carve a
 /// denied entry out of them: they get only directory-level rights (list,
-/// create, remove, rename within), never file rights, because file rights
+/// create entries), never file rights, because file rights
 /// on a directory would apply to every file beneath it — including the
 /// denied one.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -534,16 +534,23 @@ struct Grants {
 }
 
 /// Directory-level rights for a carved-out directory in the write set:
-/// list it, create entries in it, remove entries from it, and rename
-/// across it (`Refer`). None of these reads or writes file *contents*, so
-/// the denied file stays unreadable and unwritable. Two consequences are
-/// accepted and documented: an entry can be deleted or renamed even when
-/// it is denied (`rm .env` works; reading it still doesn't), and a file
-/// or directory *newly created* directly in a carved-out directory has no
-/// file rights for the rest of that spawn, because no rule covers its
-/// inode; the next `confine()` re-computes the grants and covers it. `Refer` cannot be
-/// used to launder a denied file into a granted directory: Landlock
-/// refuses any link/rename through which the file would gain rights.
+/// list it and create new entries in it — nothing else. None of these
+/// reads or writes file *contents*, so the denied entry stays unreadable
+/// and unwritable.
+///
+/// Deliberately *no* `RemoveFile`/`RemoveDir`/`Refer`: deny matching is
+/// by path, so a denied entry renamed in place (`mv .env x`, or
+/// `ln .env y && rm .env`) would no longer match at the next spawn's
+/// grant computation and would be granted in full. Without them, entries
+/// directly in a carved-out directory cannot be removed, renamed or moved
+/// out, and the swap a symlink race needs is impossible there.
+///
+/// The accepted cost (documented as the I1 limit in the README): `rm`
+/// and `mv` of entries directly in a carved-out directory fail, and a
+/// file or directory *newly created* directly in it has no file rights
+/// for the rest of that spawn, because no rule covers its inode yet —
+/// `echo a > new` leaves an empty `new`, `git init` leaves a partial
+/// `.git`. The next `confine()` re-computes the grants and covers it.
 fn carved_out_dir_write_access() -> landlock::BitFlags<AccessFs> {
     AccessFs::ReadDir
         | AccessFs::MakeDir
@@ -551,9 +558,6 @@ fn carved_out_dir_write_access() -> landlock::BitFlags<AccessFs> {
         | AccessFs::MakeSym
         | AccessFs::MakeFifo
         | AccessFs::MakeSock
-        | AccessFs::RemoveDir
-        | AccessFs::RemoveFile
-        | AccessFs::Refer
 }
 
 /// Landlock has no negative/deny rule — a domain can only ever be *more*
@@ -1375,7 +1379,7 @@ mod tests {
     // --- Directory operations in a carved-out directory (audit I1) ------
 
     #[tokio::test]
-    async fn a_carved_out_root_stays_listable_and_its_entries_manageable() {
+    async fn a_carved_out_root_stays_listable_and_extendable() {
         let dir = fixture_dir();
         std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
@@ -1383,16 +1387,23 @@ mod tests {
         let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
 
         let mut command = tokio::process::Command::new("sh");
-        command.current_dir(dir.path()).args([
-            "-c",
-            "ls . && touch newfile && mkdir newdir && rm Cargo.toml && mv src src2",
-        ]);
+        command
+            .current_dir(dir.path())
+            .args(["-c", "ls . && touch newfile && mkdir newdir"]);
         let (success, output) = run(confiner.confine(command)).await;
         assert!(success, "directory operations in the root failed: {output}");
         assert!(dir.path().join("newfile").exists());
         assert!(dir.path().join("newdir").is_dir());
-        assert!(!dir.path().join("Cargo.toml").exists());
-        assert!(dir.path().join("src2").is_dir());
+
+        // Removing or renaming entries directly in a carved-out directory
+        // is refused (see `carved_out_dir_write_access`).
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .current_dir(dir.path())
+            .args(["-c", "rm Cargo.toml; mv src src2; true"]);
+        run(confiner.confine(command)).await;
+        assert!(dir.path().join("Cargo.toml").exists());
+        assert!(dir.path().join("src").is_dir());
 
         // A later spawn re-computes the grants, so the file `touch`ed above
         // is now writable like any other non-denied entry.
@@ -1411,6 +1422,65 @@ mod tests {
         let (success, output) = run(confiner.confine(command)).await;
         assert!(!success, "the denied file must stay unreadable");
         assert!(!output.contains("SECRET"));
+    }
+
+    /// Runs `script` in `dir` under `confiner` in one spawn, then `cat`s
+    /// each of `reads` in a *later* spawn (fresh grants) and returns the
+    /// combined output of the reads.
+    async fn act_then_read(
+        confiner: &LandlockConfiner,
+        dir: &Path,
+        script: &str,
+        reads: &[&str],
+    ) -> String {
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(dir).args(["-c", script]);
+        run(confiner.confine(command)).await;
+        let mut out = String::new();
+        for read in reads {
+            let mut command = tokio::process::Command::new("cat");
+            command.current_dir(dir).arg(read);
+            out.push_str(&run(confiner.confine(command)).await.1);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn renaming_a_denied_file_in_place_does_not_expose_it_to_a_later_spawn() {
+        let dir = fixture_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let out = act_then_read(&confiner, dir.path(), "mv .env x", &["x", ".env"]).await;
+
+        assert!(!out.contains("SECRET"), "renamed denied file leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn linking_then_removing_a_denied_file_does_not_expose_it() {
+        let dir = fixture_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let out = act_then_read(&confiner, dir.path(), "ln .env y; rm .env", &["y"]).await;
+
+        assert!(!out.contains("SECRET"), "linked denied file leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn renaming_a_denied_directory_does_not_expose_its_contents() {
+        let dir = fixture_dir();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        std::fs::write(secrets.join("key"), "KEY=2").unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], std::slice::from_ref(&secrets), true);
+
+        let out = act_then_read(&confiner, dir.path(), "mv secrets s2", &["s2/key"]).await;
+
+        assert!(
+            !out.contains("KEY=2"),
+            "renamed denied directory leaked: {out}"
+        );
     }
 
     #[tokio::test]

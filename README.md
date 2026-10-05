@@ -34,9 +34,9 @@ denied file that appears later is still denied.
   compared in canonical form. Hard-link aliases of a denied file under
   those roots are denied too. `~/.cargo/credentials(.toml)` and
   `~/.config/git/credentials` are always denied. A directory that had to
-  be carved keeps directory-level rights (list, create, delete, rename),
-  so `ls`, `touch`, `mkdir`, `rm` and `mv` work in it. A denied entry
-  can still be deleted or renamed in place; its contents stay unreadable.
+  be carved keeps only list and create rights, so `ls`, `touch` and
+  `mkdir` work in it, but `rm` and `mv` of its direct entries do not (see
+  the limits below).
 - **Seccomp:** a denylist (`ptrace`, `io_uring_*`, `mount` and the new
   mount API, `bpf`, `unshare`, `setns`, `clone` with any `CLONE_NEW*` flag,
   `perf_event_open`, the keyring, ...) returns `EPERM`. `clone3` returns
