@@ -250,9 +250,9 @@ impl TmpPolicy {
 }
 
 /// Sends `SIGKILL` to the process group `pgid` — every process a
-/// confined command left behind, as long as none of them called
-/// `setsid`/`setpgid` to leave the group (see the process-group contract
-/// on `ExecutionConfiner`). `LandlockConfiner`
+/// confined command left behind (nothing can leave the group unless
+/// `ConfineOptions::allow_leaving_process_group` is set; see the
+/// process-group contract on `ExecutionConfiner`). `LandlockConfiner`
 /// makes each confined command the leader of a new group, so `pgid` is
 /// the `Child::id()` recorded right after `spawn()` — record it then,
 /// since `id()` returns `None` once the child has been reaped. A group
@@ -1019,7 +1019,8 @@ const CLONE_FLAGS_ARG: u8 = 0;
 /// without interfering:
 ///
 /// 1. The denylist (`BLOCKED_SYSCALLS`, namespace-creating `clone`,
-///    `socket(AF_UNIX)` unless opted out) → `EPERM`.
+///    `setsid`/`setpgid` and `socket(AF_UNIX)` unless opted out) →
+///    `EPERM`.
 /// 2. `clone3` → `ENOSYS`. Its flags live in a user-memory struct seccomp
 ///    cannot inspect, so it can't be filtered like `clone`; `ENOSYS` makes
 ///    glibc and others fall back to plain `clone`, which is filtered.
@@ -1097,6 +1098,14 @@ fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
             })
             .collect(),
     );
+    if !options.allow_leaving_process_group {
+        // A confined command leads its own process group (set before this
+        // filter is installed), and `kill_process_group` is how callers
+        // end everything it started. `setsid`/`setpgid` are the only ways
+        // out of that group, so they are refused.
+        rules.insert(libc::SYS_setsid, vec![]);
+        rules.insert(libc::SYS_setpgid, vec![]);
+    }
     if !options.allow_unix_sockets {
         // `socket(AF_UNIX, ...)` → EPERM: Landlock does not gate
         // `connect()` to an existing pathname Unix socket, so this is the
@@ -1379,6 +1388,23 @@ mod tests {
                     let ret =
                         libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
                     (ret as i64, last_errno())
+                }
+                "setpgid_child" | "setsid_child" => {
+                    // In a forked child, which is not a group leader, so
+                    // only seccomp can make these fail.
+                    let pid = libc::fork();
+                    if pid == 0 {
+                        let ret = if action == "setsid_child" {
+                            libc::setsid()
+                        } else {
+                            libc::setpgid(0, 0)
+                        };
+                        libc::_exit(if ret < 0 { last_errno() } else { 0 });
+                    }
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                    let code = libc::WEXITSTATUS(status);
+                    (if code == 0 { 0 } else { -1 }, code)
                 }
                 "kill" => {
                     let pid: libc::pid_t = arg.parse().unwrap();
@@ -1938,6 +1964,56 @@ mod tests {
         let pgid = unsafe { libc::getpgid(pid) };
 
         assert_eq!(pgid, pid);
+    }
+
+    #[tokio::test]
+    async fn leaving_the_process_group_is_blocked_by_default() {
+        for action in ["setpgid_child", "setsid_child"] {
+            let (ret, errno) = helper_on_default_confiner(action).await;
+            assert!(ret < 0, "{action} must fail");
+            assert_eq!(errno, libc::EPERM, "{action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_leaving_process_group_opts_out_of_the_block() {
+        let dir = fixture_dir();
+        let options = crate::ConfineOptions::new()
+            .require_enforcement(true)
+            .allow_leaving_process_group(true);
+        let confiner =
+            LandlockConfiner::with_options(dir.path(), &helper_read_paths(), &[], options);
+        for action in ["setpgid_child", "setsid_child"] {
+            let (ret, errno) = run_helper(&confiner, action, "").await;
+            assert_eq!(ret, 0, "{action} failed with errno {errno}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_setsid_background_job_cannot_outlive_kill_process_group() {
+        let dir = fixture_dir();
+        let confiner = confiner_for(dir.path());
+        let late = dir.path().join("late.txt");
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(dir.path()).args([
+            "-c",
+            "setsid sh -c 'sleep 1; echo late > late.txt' 2>/dev/null & echo started",
+        ]);
+        let child = confiner
+            .confine(command)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap();
+        child.wait_with_output().await.unwrap();
+
+        crate::kill_process_group(pgid).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+
+        assert!(
+            !late.exists(),
+            "a setsid'd job escaped the group and wrote late.txt"
+        );
     }
 
     #[test]

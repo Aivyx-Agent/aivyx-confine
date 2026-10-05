@@ -25,10 +25,11 @@ pub use confiner::{LandlockConfiner, kill_process_group};
 /// running after the tool call (a background `cmd &`, a daemonised
 /// grandchild), record `Child::id()` right after `spawn()` and call
 /// `kill_process_group` with it when the call finishes, times out or is
-/// cancelled — `kill_on_drop` alone kills only the direct child. A
-/// process that calls `setsid`/`setpgid` itself leaves the group and is
-/// not reached; containing those needs a cgroup, which this crate does
-/// not manage. `NoopConfiner` changes nothing, so never call
+/// cancelled — `kill_on_drop` alone kills only the direct child.
+/// `setsid`/`setpgid` are refused by seccomp, so nothing can leave the
+/// group unless `ConfineOptions::allow_leaving_process_group` is set; with
+/// it set, a process that leaves is not reached (containing those would
+/// need a cgroup, which this crate does not manage). `NoopConfiner` changes nothing, so never call
 /// `kill_process_group` for a command it "confined".
 pub trait ExecutionConfiner: Send + Sync {
     fn confine(&self, command: tokio::process::Command) -> tokio::process::Command;
@@ -102,6 +103,16 @@ pub struct ConfineOptions {
     /// Tools that ignore `TMPDIR` and hard-code `/tmp` fail under the
     /// default; set this only if a consumer depends on such tools.
     pub share_system_tmp: bool,
+    /// Opt out of the seccomp rule that makes `setsid()` and `setpgid()`
+    /// fail with `EPERM`. Every confined command leads its own process
+    /// group so the caller can end everything it started with
+    /// `kill_process_group`; these two syscalls are the only way out of
+    /// that group, so with this set a command can leave processes running
+    /// after the tool call (`setsid cmd &`). Non-interactive shells don't
+    /// need them and coreutils `timeout` ignores a failing `setpgid`;
+    /// interactive job control (`bash -i`, `set -m`), the `setsid` tool and
+    /// Python's `start_new_session=True` do.
+    pub allow_leaving_process_group: bool,
 }
 
 impl ConfineOptions {
@@ -116,6 +127,11 @@ impl ConfineOptions {
 
     pub fn allow_unix_sockets(mut self, value: bool) -> Self {
         self.allow_unix_sockets = value;
+        self
+    }
+
+    pub fn allow_leaving_process_group(mut self, value: bool) -> Self {
+        self.allow_leaving_process_group = value;
         self
     }
 

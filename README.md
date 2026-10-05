@@ -56,9 +56,9 @@ denied file that appears later is still denied.
   Callers own its lifetime: record `Child::id()` at spawn and call
   `kill_process_group` when the call ends, times out or is cancelled.
 
-Known limits: the network is not restricted. A process that calls
-`setsid`/`setpgid` leaves the group and is not reached by
-`kill_process_group`. On kernels whose Landlock ABI is older than V7
+Known limits: the network is not restricted. With
+`allow_leaving_process_group`, a process that calls `setsid`/`setpgid`
+leaves the group and is not reached by `kill_process_group`. On kernels whose Landlock ABI is older than V7
 (`PartiallyEnforced`), the rights and scopes they lack are not enforced,
 even with `require_enforcement`. A file created directly in a carved-out
 directory gets file rights only from the next spawn on. Hard links to
