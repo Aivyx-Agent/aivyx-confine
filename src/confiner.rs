@@ -49,6 +49,16 @@ const DEFAULT_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin",
 /// confined `git` invocation on a machine with a global config would die.
 const DEFAULT_HOME_READ_PATHS: &[&str] = &[".cargo", ".rustup", ".gitconfig", ".config/git"];
 
+/// Plaintext credential stores that live inside `DEFAULT_HOME_READ_PATHS`:
+/// the crates.io token (current and legacy file names) and git's XDG
+/// credential-store file. Never readable by a confined command — see
+/// `compute_grants`.
+const HOME_CREDENTIAL_PATHS: &[&str] = &[
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+    ".config/git/credentials",
+];
+
 /// Harmless character devices granted read+write. `/dev` is deliberately
 /// NOT granted wholesale (block devices, other users' ttys); but without at
 /// least `/dev/null` every shell construct like `2>/dev/null` dies with
@@ -303,6 +313,18 @@ impl LandlockConfiner {
         // that function only ever acts on entries actually nested under
         // the specific root it's given.
         let mut resolved_deny_paths = self.deny_paths.clone();
+        // Credential stores inside the home read grants are always carved
+        // out, whatever the consumer's own deny list says. Only existing
+        // ones: a missing one needs no carve-out, and if it appears later
+        // the next spawn's computation picks it up.
+        if let Some(home) = &self.home {
+            resolved_deny_paths.extend(
+                HOME_CREDENTIAL_PATHS
+                    .iter()
+                    .map(|p| home.join(p))
+                    .filter(|p| p.symlink_metadata().is_ok()),
+            );
+        }
         if let Some(patterns) = &self.bare_patterns {
             // A poisoned lock only means another spawn panicked mid-walk;
             // the cache is advisory, so start from whatever it holds.
@@ -1360,6 +1382,39 @@ mod tests {
         let confiner = LandlockConfiner::new(dir.path(), &[], std::slice::from_ref(&secret), true);
 
         assert!(!cat_succeeds(&confiner, &dir.path().join("sub/alias")).await);
+    }
+
+    // --- Credential stores inside the home grants (audit I6) -----------
+
+    #[tokio::test]
+    async fn credential_stores_inside_home_grants_are_never_readable() {
+        let home = fixture_dir();
+        let cargo = home.path().join(".cargo");
+        let git = home.path().join(".config/git");
+        std::fs::create_dir_all(cargo.join("bin")).unwrap();
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(cargo.join("credentials.toml"), "token = \"cio-secret\"").unwrap();
+        std::fs::write(cargo.join("credentials"), "token = \"cio-legacy\"").unwrap();
+        std::fs::write(git.join("credentials"), "https://u:ghp-secret@github.com").unwrap();
+        std::fs::write(cargo.join("bin/tool"), "fine").unwrap();
+        std::fs::write(git.join("config"), "[user]").unwrap();
+        let dir = fixture_dir();
+        let mut confiner = confiner_for(dir.path());
+        confiner.home = Some(home.path().to_path_buf());
+
+        for secret in [
+            cargo.join("credentials.toml"),
+            cargo.join("credentials"),
+            git.join("credentials"),
+        ] {
+            assert!(
+                !cat_succeeds(&confiner, &secret).await,
+                "{} must not be readable",
+                secret.display()
+            );
+        }
+        assert!(cat_succeeds(&confiner, &cargo.join("bin/tool")).await);
+        assert!(cat_succeeds(&confiner, &git.join("config")).await);
     }
 
     // --- Signal and abstract-socket scoping (audit I5) -------------------
