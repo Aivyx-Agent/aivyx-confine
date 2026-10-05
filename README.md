@@ -97,8 +97,10 @@ denied file that appears later is still denied.
   planted `~/.cargo -> /` — so a symlinked toolchain dir is not granted;
   tools needing it fail with `EACCES`. Real (non-symlink) toolchain dirs
   are unaffected.
-- **Grant roots inside a denied path** (an `extra_read_paths` entry, or a
-  toolchain dir, under a `deny_paths` directory) are never granted.
+- **Grant roots inside a denied path** (an `extra_read_paths` entry, a
+  toolchain dir, or `cwd` itself, under a `deny_paths` directory) are never
+  granted — a `cwd` inside a denied directory gets no read or write access
+  at all.
 - **Kernel ABI.** On kernels whose Landlock ABI is older than V7
   (`PartiallyEnforced`), the rights and scopes they lack are not enforced,
   even with `require_enforcement`: below ABI 6 there are no signal or
