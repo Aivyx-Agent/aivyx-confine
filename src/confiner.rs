@@ -190,8 +190,17 @@ pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &[
 ];
 
 pub struct LandlockConfiner {
-    read_grants: Grants,
-    write_grants: Grants,
+    cwd: PathBuf,
+    extra_read_paths: Vec<PathBuf>,
+    /// The non-bare `deny_paths` entries, used as-is.
+    deny_paths: Vec<PathBuf>,
+    /// The bare (single-component) `deny_paths` entries, compiled once.
+    /// `None` when there are none, so no filesystem walk ever happens.
+    bare_patterns: Option<globset::GlobSet>,
+    /// The previous bare-pattern walk, so unchanged directories are not
+    /// re-read on every spawn. See `walk_for_basename_matches`.
+    scan_cache: std::sync::Mutex<ScanCache>,
+    home: Option<PathBuf>,
     seccomp_program: BpfProgram,
     require_enforcement: bool,
 }
@@ -213,6 +222,10 @@ impl LandlockConfiner {
         )
     }
 
+    /// Cheap: records the policy and compiles the seccomp filter. The
+    /// filesystem grants (including the `deny_paths` carve-outs) are
+    /// computed afresh on every `confine()` call, so a denied file that
+    /// appears after construction is still denied to later spawns.
     pub fn with_options(
         cwd: &Path,
         extra_read_paths: &[PathBuf],
@@ -233,46 +246,69 @@ impl LandlockConfiner {
             );
         }
 
+        let (bare, non_bare): (Vec<&PathBuf>, Vec<&PathBuf>) =
+            deny_paths.iter().partition(|p| crate::is_bare_pattern(p));
+
+        Self {
+            cwd: cwd.to_path_buf(),
+            extra_read_paths: extra_read_paths.to_vec(),
+            deny_paths: non_bare.into_iter().cloned().collect(),
+            bare_patterns: compile_bare_patterns(&bare),
+            scan_cache: std::sync::Mutex::new(ScanCache::new()),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            seccomp_program: build_seccomp_filter(&options),
+            require_enforcement,
+        }
+    }
+
+    /// Computes the read and write grants from the current filesystem
+    /// state. Runs in the parent, before fork, on every `confine()`.
+    fn compute_grants(&self) -> (Grants, Grants) {
         // Bare deny_paths patterns (e.g. `.env`) are resolved into
-        // concrete file paths, once, by scanning every project-relevant
-        // root — `cwd` and each `extra_read_paths` entry, the roots a
-        // project's own secrets could plausibly live under. The combined
-        // result is reused for *every* grant computation below,
-        // including the fixed system paths and the OS temp directory:
-        // any of them could, in principle, be an ancestor of a
-        // project-relevant root (an `/etc/nixos`-style system-config-as-
-        // project-repo, or `cwd` nested inside the system temp dir in
-        // tests/scratch directories) and would otherwise silently
+        // concrete file paths by scanning every project-relevant root —
+        // `cwd` and each `extra_read_paths` entry, the roots a project's
+        // own secrets could plausibly live under. The combined result is
+        // reused for *every* grant computation below, including the fixed
+        // system paths and the temp directory: any of them could, in
+        // principle, be an ancestor of a project-relevant root (an
+        // `/etc/nixos`-style system-config-as-project-repo, or `cwd`
+        // nested inside the system temp dir) and would otherwise silently
         // re-grant whatever that root's own narrower carve-out just
         // excluded. Passing the same fully-resolved list to every
         // `grant_paths_excluding` call is safe, not overly permissive —
         // that function only ever acts on entries actually nested under
-        // the specific root it's given — and reusing the already-computed
-        // matches this way costs nothing extra; `find_basename_glob_matches`
-        // itself is a no-op whenever `deny_paths` has no bare entries at
-        // all.
-        let mut resolved_deny_paths = deny_paths.to_vec();
-        resolved_deny_paths.extend(find_basename_glob_matches(cwd, deny_paths));
-        for extra_root in extra_read_paths {
-            resolved_deny_paths.extend(find_basename_glob_matches(extra_root, deny_paths));
+        // the specific root it's given.
+        let mut resolved_deny_paths = self.deny_paths.clone();
+        if let Some(patterns) = &self.bare_patterns {
+            // A poisoned lock only means another spawn panicked mid-walk;
+            // the cache is advisory, so start from whatever it holds.
+            let mut cache = self
+                .scan_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut next = ScanCache::new();
+            for root in std::iter::once(&self.cwd).chain(&self.extra_read_paths) {
+                walk_for_basename_matches(
+                    root,
+                    patterns,
+                    &mut cache,
+                    &mut next,
+                    &mut resolved_deny_paths,
+                );
+            }
+            *cache = next;
         }
 
         // `grant_paths_excluding` is applied uniformly to every candidate
-        // root — any of them could, in principle, contain a nested
-        // `deny_paths` entry (see the comment above for why the resolved
-        // bare-pattern matches specifically need this uniform treatment,
-        // beyond the original reasoning about absolute nested entries).
-        // It's a no-op (returns the root unchanged) whenever nothing is
-        // actually nested underneath, so this costs nothing extra in the
-        // common case.
+        // root. It grants the root whole whenever nothing is nested
+        // underneath, so this costs nothing extra in the common case.
         let mut read_candidates: Vec<PathBuf> =
             DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
+        if let Some(home) = &self.home {
             read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
         }
-        read_candidates.push(cwd.to_path_buf());
-        read_candidates.extend(extra_read_paths.iter().cloned());
+        read_candidates.push(self.cwd.clone());
+        read_candidates.extend(self.extra_read_paths.iter().cloned());
         let mut read_grants = Grants::default();
         for root in &read_candidates {
             grant_paths_excluding(root, &resolved_deny_paths, &mut read_grants);
@@ -283,7 +319,7 @@ impl LandlockConfiner {
             .full
             .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let mut write_candidates = vec![cwd.to_path_buf(), std::env::temp_dir()];
+        let mut write_candidates = vec![self.cwd.clone(), std::env::temp_dir()];
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             write_candidates.push(PathBuf::from(tmpdir));
         }
@@ -298,14 +334,7 @@ impl LandlockConfiner {
             .full
             .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let seccomp_program = build_seccomp_filter(&options);
-
-        Self {
-            read_grants,
-            write_grants,
-            seccomp_program,
-            require_enforcement,
-        }
+        (read_grants, write_grants)
     }
 
     /// Builds the full ruleset here, in the parent process, before `fork()`
@@ -315,23 +344,21 @@ impl LandlockConfiner {
     /// no locks). `RulesetCreated::restrict_self()` itself is verified to
     /// be a thin syscall wrapper over this already-built state.
     fn build_ruleset(&self) -> Result<RulesetCreated, landlock::RulesetError> {
+        let (read_grants, write_grants) = self.compute_grants();
         Ruleset::default()
             .handle_access(AccessFs::from_all(LANDLOCK_ABI))?
             .create()?
             .add_rules(path_beneath_rules(
-                &self.read_grants.full,
+                &read_grants.full,
                 AccessFs::from_read(LANDLOCK_ABI),
             ))?
+            .add_rules(path_beneath_rules(&read_grants.dir_only, AccessFs::ReadDir))?
             .add_rules(path_beneath_rules(
-                &self.read_grants.dir_only,
-                AccessFs::ReadDir,
-            ))?
-            .add_rules(path_beneath_rules(
-                &self.write_grants.full,
+                &write_grants.full,
                 AccessFs::from_all(LANDLOCK_ABI),
             ))?
             .add_rules(path_beneath_rules(
-                &self.write_grants.dir_only,
+                &write_grants.dir_only,
                 carved_out_dir_write_access(),
             ))
     }
@@ -357,8 +384,8 @@ struct Grants {
 /// accepted and documented: an entry can be deleted or renamed even when
 /// it is denied (`rm .env` works; reading it still doesn't), and a file
 /// or directory *newly created* directly in a carved-out directory has no
-/// file rights, because no rule covers its inode — until the grants are
-/// next computed. `Refer` cannot be
+/// file rights for the rest of that spawn, because no rule covers its
+/// inode; the next `confine()` re-computes the grants and covers it. `Refer` cannot be
 /// used to launder a denied file into a granted directory: Landlock
 /// refuses any link/rename through which the file would gain rights.
 fn carved_out_dir_write_access() -> landlock::BitFlags<AccessFs> {
@@ -426,68 +453,140 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grant
     }
 }
 
-/// Recursively finds every path under `root` whose basename matches a
-/// bare (single-component) `deny_paths` pattern — the concrete
-/// file-level exclusions `LandlockConfiner::new` needs before granting
-/// `root`, since `grant_paths_excluding` only understands specific
-/// absolute paths to carve out, not "matches anywhere" patterns. Returns
-/// immediately without touching the filesystem if `deny_paths` has no
-/// bare entries at all.
-///
-/// Each match found here forces `grant_paths_excluding` to enumerate its
-/// containing directory child-by-child instead of granting it wholesale
-/// (see that function's own doc comment) — a project with many matching
-/// files (e.g. a `node_modules` tree containing numerous test `*.pem`
-/// fixtures) will produce a larger Landlock ruleset, rebuilt on every
-/// command spawn via `LandlockConfiner::confine`. This is a real,
-/// match-count-proportional cost, accepted as the price of closing the
-/// security gap this function exists for — not a bug, but worth knowing
-/// if a project's grant construction becomes noticeably slower after
-/// adding a broad bare pattern.
-fn find_basename_glob_matches(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
-    let bare_patterns: Vec<PathBuf> = deny_paths
-        .iter()
-        .filter(|p| crate::is_bare_pattern(p))
-        .cloned()
-        .collect();
-    if bare_patterns.is_empty() {
-        return Vec::new();
+/// Compiles the bare (single-component) `deny_paths` patterns into one
+/// matcher, once, at construction — matching every directory entry
+/// against a freshly compiled glob per pattern was the dominant cost of
+/// the walk. An entry that is not a valid glob is dropped with a warning,
+/// matching `crate::is_basename_glob_match`, which treats it as matching
+/// nothing.
+fn compile_bare_patterns(patterns: &[&PathBuf]) -> Option<globset::GlobSet> {
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut any = false;
+    for pattern in patterns {
+        let Some(text) = pattern.to_str() else {
+            continue;
+        };
+        match globset::Glob::new(text) {
+            Ok(glob) => {
+                builder.add(glob);
+                any = true;
+            }
+            Err(err) => {
+                tracing::warn!(pattern = text, error = %err, "ignoring invalid deny_paths pattern");
+            }
+        }
     }
-    let mut matches = Vec::new();
-    walk_for_basename_matches(root, &bare_patterns, &mut matches);
-    matches
+    if !any {
+        return None;
+    }
+    builder.build().ok()
 }
 
-fn walk_for_basename_matches(dir: &Path, bare_patterns: &[PathBuf], matches: &mut Vec<PathBuf>) {
+/// What one directory contributed to the last bare-pattern walk, keyed
+/// by the directory's identity and mtime. Creating, deleting or renaming
+/// an entry updates a directory's mtime, so an unchanged mtime means the
+/// cached entry lists are still exact and the `read_dir` can be skipped —
+/// one `stat` per directory instead of one `read_dir` plus a glob match
+/// per entry.
+struct DirScan {
+    dev: u64,
+    ino: u64,
+    mtime: (i64, i64),
+    matches: Vec<PathBuf>,
+    subdirs: Vec<PathBuf>,
+}
+
+type ScanCache = std::collections::HashMap<PathBuf, DirScan>;
+
+/// A directory modified this recently is never cached: filesystem
+/// timestamps come from a coarse clock, so an entry created in the same
+/// tick as the scan could leave the mtime unchanged ("racy git" problem).
+const SCAN_CACHE_SETTLE_SECS: i64 = 2;
+
+/// Recursively finds every path under `dir` whose basename matches a
+/// bare `deny_paths` pattern — the concrete file-level exclusions
+/// `grant_paths_excluding` needs, since it only understands specific
+/// absolute paths to carve out, not "matches anywhere" patterns.
+///
+/// Runs on every `confine()` call when bare patterns are configured, so a
+/// match that appears after construction is still denied. `prev` is the
+/// previous walk's cache (entries are moved out of it as they are
+/// visited); every directory visited is recorded in `next`, which
+/// replaces it (so directories that disappeared drop out). Even
+/// fully cached, the walk is one `stat` per directory in the tree (minus
+/// `.git`), synchronously — callers on an async runtime should call
+/// `confine()` from a blocking-capable context for very large trees.
+/// Each match also forces `grant_paths_excluding` to enumerate its
+/// containing directory child-by-child, so a project with many matching
+/// files produces a larger Landlock ruleset.
+fn walk_for_basename_matches(
+    dir: &Path,
+    patterns: &globset::GlobSet,
+    prev: &mut ScanCache,
+    next: &mut ScanCache,
+    matches: &mut Vec<PathBuf>,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    let mtime = (meta.mtime(), meta.mtime_nsec());
+    if let Some(cached) = prev.remove(dir)
+        && cached.dev == meta.dev()
+        && cached.ino == meta.ino()
+        && cached.mtime == mtime
+    {
+        matches.extend(cached.matches.iter().cloned());
+        for subdir in &cached.subdirs {
+            walk_for_basename_matches(subdir, patterns, prev, next, matches);
+        }
+        next.insert(dir.to_path_buf(), cached);
+        return;
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let mut own_matches = Vec::new();
+    let mut subdirs = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if bare_patterns
-            .iter()
-            .any(|pattern| crate::is_basename_glob_match(&path, pattern))
-        {
-            matches.push(path);
+        let name = entry.file_name();
+        if patterns.is_match(Path::new(&name)) {
+            own_matches.push(entry.path());
             continue; // matched — no need to recurse further into it
         }
         // `file_type()` reflects the entry itself, not a symlink's
         // target, so a symlinked directory is never recursed into —
         // this is what keeps a symlink cycle from causing unbounded
-        // recursion here (unlike `grant_paths_excluding`, this function
-        // recurses into *every* subdirectory by default, so this guard
-        // matters more here).
-        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-            // `.git` directories never legitimately hold a project's own
-            // secrets — they hold git's own internal object database and
-            // refs — so skipping them cuts real walk cost (a `.git`
-            // directory can be large) without weakening the security
-            // guarantee this scan exists for.
-            if path.file_name().is_some_and(|name| name == ".git") {
-                continue;
-            }
-            walk_for_basename_matches(&path, bare_patterns, matches);
+        // recursion here.
+        //
+        // `.git` directories never legitimately hold a project's own
+        // secrets — they hold git's own internal object database and
+        // refs — so skipping them cuts real walk cost without weakening
+        // the guarantee this scan exists for.
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) && name != ".git" {
+            subdirs.push(entry.path());
         }
+    }
+    matches.extend(own_matches.iter().cloned());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    if now - mtime.0 >= SCAN_CACHE_SETTLE_SECS {
+        next.insert(
+            dir.to_path_buf(),
+            DirScan {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mtime,
+                matches: own_matches,
+                subdirs: subdirs.clone(),
+            },
+        );
+    }
+    for subdir in &subdirs {
+        walk_for_basename_matches(subdir, patterns, prev, next, matches);
     }
 }
 
@@ -635,6 +734,24 @@ mod tests {
             .prefix("fx-")
             .tempdir_in(fixture_root())
             .unwrap()
+    }
+
+    fn find_basename_glob_matches(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
+        let bare: Vec<&PathBuf> = deny_paths
+            .iter()
+            .filter(|p| crate::is_bare_pattern(p))
+            .collect();
+        let mut matches = Vec::new();
+        if let Some(patterns) = compile_bare_patterns(&bare) {
+            walk_for_basename_matches(
+                root,
+                &patterns,
+                &mut ScanCache::new(),
+                &mut ScanCache::new(),
+                &mut matches,
+            );
+        }
+        matches
     }
 
     fn confiner_for(dir: &Path) -> LandlockConfiner {
@@ -914,6 +1031,18 @@ mod tests {
         assert!(!dir.path().join("Cargo.toml").exists());
         assert!(dir.path().join("src2").is_dir());
 
+        // A later spawn re-computes the grants, so the file `touch`ed above
+        // is now writable like any other non-denied entry.
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .current_dir(dir.path())
+            .args(["-c", "echo content > newfile"]);
+        let (success, output) = run(confiner.confine(command)).await;
+        assert!(
+            success,
+            "writing the new file in a later spawn failed: {output}"
+        );
+
         let mut command = tokio::process::Command::new("cat");
         command.arg(dir.path().join(".env"));
         let (success, output) = run(confiner.confine(command)).await;
@@ -937,6 +1066,55 @@ mod tests {
             !output.contains("SECRET"),
             "denied content leaked: {output}"
         );
+    }
+
+    // --- Deny matches appearing after construction (audit I2) ----------
+
+    #[tokio::test]
+    async fn a_bare_pattern_match_created_after_construction_is_still_denied() {
+        let dir = fixture_dir();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+        std::fs::write(dir.path().join("sub/.env"), "LATE=1").unwrap();
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join("sub/.env"));
+        let (success, output) = run(confiner.confine(command)).await;
+        assert!(!success, "late .env must not be readable: {output}");
+        assert!(!output.contains("LATE"));
+    }
+
+    fn age_dir(path: &Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    async fn cat_succeeds(confiner: &LandlockConfiner, path: &Path) -> bool {
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(path);
+        run(confiner.confine(command)).await.0
+    }
+
+    #[tokio::test]
+    async fn the_scan_cache_keeps_denying_and_notices_new_matches() {
+        let dir = fixture_dir();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        age_dir(&sub);
+        age_dir(dir.path());
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        // First spawn populates the cache (both dirs are old enough).
+        assert!(!cat_succeeds(&confiner, &dir.path().join(".env")).await);
+        // Second spawn is served from the cache and must still deny.
+        assert!(!cat_succeeds(&confiner, &dir.path().join(".env")).await);
+        // A new match bumps `sub`'s mtime, invalidating its cache entry.
+        std::fs::write(sub.join(".env"), "LATE=1").unwrap();
+        assert!(!cat_succeeds(&confiner, &sub.join(".env")).await);
     }
 
     #[tokio::test]

@@ -33,9 +33,10 @@ impl ExecutionConfiner for NoopConfiner {
 /// `*.pem`) is a basename-glob pattern, not a real filesystem location to
 /// resolve. `pub` because two independent consumers need to classify a
 /// `deny_paths` entry identically rather than each re-deriving the same
-/// check on their own: this crate's own `LandlockConfiner` (via
-/// `find_basename_glob_matches`), and `aivyx-sandbox`'s `path_is_denied`
-/// (in `aivyx-coder`) — a distinct, cross-crate consumer
+/// check on their own: this crate's own `LandlockConfiner` (when it
+/// splits `deny_paths` into bare patterns and real paths), and
+/// `aivyx-sandbox`'s `path_is_denied` (in `aivyx-coder`) — a distinct,
+/// cross-crate consumer
 /// unrelated to process confinement (it gates `ConfirmationGate`'s
 /// permission decisions), found by reading `aivyx-sandbox`'s actual
 /// current code before this crate was designed, not assumed.
