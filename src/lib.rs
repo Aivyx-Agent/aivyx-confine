@@ -71,17 +71,20 @@ pub fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
 }
 
 /// Policy knobs for `LandlockConfiner::with_options` /
-/// `default_confiner_with_options`. `ConfineOptions::default()` is the
-/// strict policy every field's own doc describes; each `bool` that is
-/// `false` by default is an explicit opt-out a consumer must choose.
+/// `default_confiner_with_options`. `ConfineOptions::default()` (same as
+/// `new()`) is the strict policy: `require_enforcement` is `true`, and
+/// every other `bool` is `false`, an explicit opt-out a consumer must
+/// choose.
 /// `#[non_exhaustive]` so new knobs can be added without breaking
 /// consumers: build one with `ConfineOptions::new()` and the setters.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConfineOptions {
-    /// Refuse to spawn (rather than run unconfined) when Landlock cannot
-    /// be applied at all. Same meaning as the `require_enforcement`
-    /// argument of `LandlockConfiner::new`.
+    /// Refuse to spawn (rather than run without filesystem confinement)
+    /// when Landlock cannot be applied at all. Same meaning as the
+    /// `require_enforcement` argument of `LandlockConfiner::new`. Defaults
+    /// to `true` (fail closed); set `false` only for kernels known to lack
+    /// Landlock.
     pub require_enforcement: bool,
     /// Opt out of the seccomp rule that makes `socket(AF_UNIX, ...)` fail
     /// with `EPERM`. Landlock does not gate `connect()` to an existing
@@ -113,6 +116,17 @@ pub struct ConfineOptions {
     /// interactive job control (`bash -i`, `set -m`), the `setsid` tool and
     /// Python's `start_new_session=True` do.
     pub allow_leaving_process_group: bool,
+}
+
+impl Default for ConfineOptions {
+    fn default() -> Self {
+        Self {
+            require_enforcement: true,
+            allow_unix_sockets: false,
+            share_system_tmp: false,
+            allow_leaving_process_group: false,
+        }
+    }
 }
 
 impl ConfineOptions {
@@ -190,6 +204,16 @@ pub fn default_confiner_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confine_options_default_to_the_strict_policy() {
+        for options in [ConfineOptions::new(), ConfineOptions::default()] {
+            assert!(options.require_enforcement, "must fail closed by default");
+            assert!(!options.allow_unix_sockets);
+            assert!(!options.share_system_tmp);
+            assert!(!options.allow_leaving_process_group);
+        }
+    }
 
     #[test]
     fn noop_confiner_returns_the_command_unchanged() {
