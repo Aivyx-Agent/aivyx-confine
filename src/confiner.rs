@@ -299,6 +299,18 @@ impl LandlockConfiner {
             *cache = next;
         }
 
+        // Landlock rules are inode-based but denies are path-based, so a
+        // second hard link to a denied file would be readable through its
+        // other name. Find every such alias under the project roots and
+        // deny it too. Only runs when a denied file actually has more
+        // than one link, which is rare.
+        let linked_inodes = multiply_linked_inodes(&resolved_deny_paths);
+        if !linked_inodes.is_empty() {
+            for root in std::iter::once(&self.cwd).chain(&self.extra_read_paths) {
+                find_hardlink_aliases(root, &linked_inodes, &mut resolved_deny_paths);
+            }
+        }
+
         // `grant_paths_excluding` is applied uniformly to every candidate
         // root. It grants the root whole whenever nothing is nested
         // underneath, so this costs nothing extra in the common case.
@@ -449,6 +461,46 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grant
             grant_paths_excluding(&child, deny_paths, grants);
         } else {
             grants.full.push(child);
+        }
+    }
+}
+
+/// `(dev, ino)` of every denied regular file that has more than one hard
+/// link.
+fn multiply_linked_inodes(deny_paths: &[PathBuf]) -> std::collections::HashSet<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    deny_paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .filter(|meta| meta.is_file() && meta.nlink() > 1)
+        .map(|meta| (meta.dev(), meta.ino()))
+        .collect()
+}
+
+/// Appends every regular file under `dir` (not following symlinks, and
+/// including `.git`) whose `(dev, ino)` is in `inodes`. Paths already in
+/// `out` are appended again harmlessly.
+fn find_hardlink_aliases(
+    dir: &Path,
+    inodes: &std::collections::HashSet<(u64, u64)>,
+    out: &mut Vec<PathBuf>,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            find_hardlink_aliases(&entry.path(), inodes, out);
+        } else if file_type.is_file()
+            && let Ok(meta) = entry.metadata()
+            && meta.nlink() > 1
+            && inodes.contains(&(meta.dev(), meta.ino()))
+        {
+            out.push(entry.path());
         }
     }
 }
@@ -1115,6 +1167,33 @@ mod tests {
         // A new match bumps `sub`'s mtime, invalidating its cache entry.
         std::fs::write(sub.join(".env"), "LATE=1").unwrap();
         assert!(!cat_succeeds(&confiner, &sub.join(".env")).await);
+    }
+
+    // --- Hardlinks to denied files (audit I3) ---------------------------
+
+    #[tokio::test]
+    async fn a_hardlink_to_a_denied_file_is_denied_too() {
+        let dir = fixture_dir();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::hard_link(dir.path().join(".env"), dir.path().join("notsecret")).unwrap();
+        std::fs::hard_link(dir.path().join(".env"), dir.path().join("sub/alias")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        assert!(!cat_succeeds(&confiner, &dir.path().join("notsecret")).await);
+        assert!(!cat_succeeds(&confiner, &dir.path().join("sub/alias")).await);
+    }
+
+    #[tokio::test]
+    async fn a_hardlink_to_an_absolute_denied_file_is_denied_too() {
+        let dir = fixture_dir();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "SECRET=1").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::hard_link(&secret, dir.path().join("sub/alias")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], std::slice::from_ref(&secret), true);
+
+        assert!(!cat_succeeds(&confiner, &dir.path().join("sub/alias")).await);
     }
 
     #[tokio::test]
