@@ -286,6 +286,9 @@ pub struct LandlockConfiner {
     /// re-read on every spawn. See `walk_for_basename_matches`.
     scan_cache: std::sync::Mutex<ScanCache>,
     home: Option<PathBuf>,
+    /// `SCAN_CACHE_SETTLE_SECS`, as a field so tests can exercise the
+    /// cache without waiting.
+    scan_settle_secs: i64,
     /// The temp-dir policy: `Shared` with `share_system_tmp`, otherwise the
     /// private directory (`None` if it could not be created, in which case
     /// no temp directory is writable at all).
@@ -349,6 +352,7 @@ impl LandlockConfiner {
             bare_patterns: compile_bare_patterns(&bare),
             scan_cache: std::sync::Mutex::new(ScanCache::new()),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            scan_settle_secs: SCAN_CACHE_SETTLE_SECS,
             tmp: TmpPolicy::new(options.share_system_tmp),
             seccomp_programs: build_seccomp_filters(&options),
             require_enforcement,
@@ -423,6 +427,7 @@ impl LandlockConfiner {
             for root in std::iter::once(&cwd).chain(&extra_read_paths) {
                 walk_for_basename_matches(
                     root,
+                    self.scan_settle_secs,
                     patterns,
                     &mut cache,
                     &mut next,
@@ -880,15 +885,17 @@ fn compile_bare_patterns(patterns: &[&PathBuf]) -> Option<globset::GlobSet> {
 }
 
 /// What one directory contributed to the last bare-pattern walk, keyed
-/// by the directory's identity and mtime. Creating, deleting or renaming
-/// an entry updates a directory's mtime, so an unchanged mtime means the
-/// cached entry lists are still exact and the `read_dir` can be skipped —
-/// one `stat` per directory instead of one `read_dir` plus a glob match
-/// per entry.
+/// by the directory's identity, mtime and ctime. Creating, deleting or
+/// renaming an entry updates both; userspace can set the mtime back
+/// (`touch -d`, `tar`, `rsync -a`, `cp -a`) but not the ctime, so an
+/// unchanged pair means the cached entry lists are still exact and the
+/// directory need not be re-read — one `fstat` per directory instead of a
+/// `readdir` plus a glob match per entry.
 struct DirScan {
     dev: u64,
     ino: u64,
     mtime: (i64, i64),
+    ctime: (i64, i64),
     matches: Vec<PathBuf>,
     /// Names of entries that may be directories to descend into.
     subdirs: Vec<OsString>,
@@ -896,8 +903,8 @@ struct DirScan {
 
 type ScanCache = std::collections::HashMap<PathBuf, DirScan>;
 
-/// A directory modified this recently is never cached: filesystem
-/// timestamps come from a coarse clock, so an entry created in the same
+/// A directory modified (mtime or ctime) this recently is never cached:
+/// filesystem timestamps come from a coarse clock, so an entry created in the same
 /// tick as the scan could leave the mtime unchanged ("racy git" problem).
 const SCAN_CACHE_SETTLE_SECS: i64 = 2;
 
@@ -919,19 +926,29 @@ const SCAN_CACHE_SETTLE_SECS: i64 = 2;
 /// files produces a larger Landlock ruleset.
 fn walk_for_basename_matches(
     root: &Path,
+    settle_secs: i64,
     patterns: &globset::GlobSet,
     prev: &mut ScanCache,
     next: &mut ScanCache,
     matches: &mut Vec<PathBuf>,
 ) {
     if let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) {
-        walk_dir_for_basename_matches(root, dir.as_fd(), patterns, prev, next, matches);
+        walk_dir_for_basename_matches(
+            root,
+            dir.as_fd(),
+            settle_secs,
+            patterns,
+            prev,
+            next,
+            matches,
+        );
     }
 }
 
 fn walk_dir_for_basename_matches(
     path: &Path,
     dir: BorrowedFd<'_>,
+    settle_secs: i64,
     patterns: &globset::GlobSet,
     prev: &mut ScanCache,
     next: &mut ScanCache,
@@ -941,9 +958,13 @@ fn walk_dir_for_basename_matches(
         return;
     };
     let mtime = (st.st_mtime, st.st_mtime_nsec);
+    let ctime = (st.st_ctime, st.st_ctime_nsec);
     let scan = match prev.remove(path) {
         Some(cached)
-            if cached.dev == st.st_dev && cached.ino == st.st_ino && cached.mtime == mtime =>
+            if cached.dev == st.st_dev
+                && cached.ino == st.st_ino
+                && cached.mtime == mtime
+                && cached.ctime == ctime =>
         {
             cached
         }
@@ -952,6 +973,7 @@ fn walk_dir_for_basename_matches(
                 dev: st.st_dev,
                 ino: st.st_ino,
                 mtime,
+                ctime,
                 matches: Vec::new(),
                 subdirs: Vec::new(),
             };
@@ -980,6 +1002,7 @@ fn walk_dir_for_basename_matches(
             walk_dir_for_basename_matches(
                 &path.join(name),
                 subdir.as_fd(),
+                settle_secs,
                 patterns,
                 prev,
                 next,
@@ -990,7 +1013,7 @@ fn walk_dir_for_basename_matches(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    if now - mtime.0 >= SCAN_CACHE_SETTLE_SECS {
+    if now - mtime.0.max(ctime.0) >= settle_secs {
         next.insert(path.to_path_buf(), scan);
     }
 }
@@ -1330,6 +1353,7 @@ mod tests {
         if let Some(patterns) = compile_bare_patterns(&bare) {
             walk_for_basename_matches(
                 root,
+                SCAN_CACHE_SETTLE_SECS,
                 &patterns,
                 &mut ScanCache::new(),
                 &mut ScanCache::new(),
@@ -1864,14 +1888,6 @@ mod tests {
         assert!(!output.contains("LATE"));
     }
 
-    fn age_dir(path: &Path) {
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::open(path)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-    }
-
     async fn cat_succeeds(confiner: &LandlockConfiner, path: &Path) -> bool {
         let mut command = tokio::process::Command::new("cat");
         command.arg(path);
@@ -1884,16 +1900,39 @@ mod tests {
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
-        age_dir(&sub);
-        age_dir(dir.path());
-        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+        let mut confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+        confiner.scan_settle_secs = 0;
 
-        // First spawn populates the cache (both dirs are old enough).
+        // First spawn populates the cache.
         assert!(!cat_succeeds(&confiner, &dir.path().join(".env")).await);
         // Second spawn is served from the cache and must still deny.
         assert!(!cat_succeeds(&confiner, &dir.path().join(".env")).await);
-        // A new match bumps `sub`'s mtime, invalidating its cache entry.
+        // A new match bumps `sub`'s mtime and ctime, invalidating its
+        // cache entry (after a pause, so the coarse clock has moved on).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         std::fs::write(sub.join(".env"), "LATE=1").unwrap();
+        assert!(!cat_succeeds(&confiner, &sub.join(".env")).await);
+    }
+
+    #[tokio::test]
+    async fn the_scan_cache_is_not_fooled_by_a_restored_mtime() {
+        let dir = fixture_dir();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let old_mtime = std::fs::metadata(&sub).unwrap().modified().unwrap();
+        let mut confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+        confiner.scan_settle_secs = 0;
+
+        // Populate the cache, then add a match and put `sub`'s mtime back,
+        // as `tar`, `rsync -a` or `cp -a` would.
+        assert!(!cat_succeeds(&confiner, &sub.join("missing")).await);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::write(sub.join(".env"), "LATE=1").unwrap();
+        std::fs::File::open(&sub)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
         assert!(!cat_succeeds(&confiner, &sub.join(".env")).await);
     }
 
