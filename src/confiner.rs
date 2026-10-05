@@ -206,16 +206,16 @@ fn detect_landlock_abi() -> i64 {
     }
 }
 
-/// Environment variables that point a process at a session-level IPC
-/// endpoint (D-Bus, ssh-agent, gpg-agent, Wayland, X11, the user runtime
-/// dir that holds most of their sockets). Removed from every confined
-/// command — see `ConfineOptions::allow_unix_sockets` for why reaching
-/// those endpoints is an escape, not just an information leak.
 /// `__X32_SYSCALL_BIT`: x86_64 syscall numbers with this bit set select
 /// the x32 ABI, which shares `AUDIT_ARCH_X86_64` with native calls.
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
+/// Environment variables that point a process at a session-level IPC
+/// endpoint (D-Bus, ssh-agent, gpg-agent, Wayland, X11, the user runtime
+/// dir that holds most of their sockets). Removed from every confined
+/// command — see `ConfineOptions::allow_unix_sockets` for why reaching
+/// those endpoints is an escape, not just an information leak.
 pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
