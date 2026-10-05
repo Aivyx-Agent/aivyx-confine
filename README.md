@@ -49,24 +49,91 @@ denied file that appears later is still denied.
   `socketpair()` is refused too (unless opted out), since an unconnected
   datagram end can `sendto()` any pathname datagram socket (`/dev/log`).
 - **Landlock scopes (kernel ABI 6+):** no signals to processes outside the
-  sandbox, and no connections to abstract Unix sockets outside it.
+  sandbox, and no connections to abstract Unix sockets outside it. Each
+  `confine()` call creates its own Landlock domain, so "outside" includes
+  the caller and processes started by *earlier* confined spawns: a command
+  cannot kill a dev server a previous tool call started.
 - **Environment:** `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`,
   `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`, `WAYLAND_DISPLAY` and `DISPLAY` are
   removed. A consumer that opts into Unix sockets and needs one of them can
   set it on the `Command` after `confine()`.
-- **Process group:** each confined command leads a new process group.
-  Callers own its lifetime: record `Child::id()` at spawn and call
-  `kill_process_group` when the call ends, times out or is cancelled.
+- **Process group:** each confined command leads a new process group, and
+  `setsid`/`setpgid` return `EPERM` unless
+  `ConfineOptions::allow_leaving_process_group` is set, so nothing it
+  starts can leave the group. Callers own the group's lifetime: record
+  `Child::id()` at spawn and call `kill_process_group` when the call ends,
+  times out or is cancelled.
 
-Known limits: the network is not restricted. With
-`allow_leaving_process_group`, a process that calls `setsid`/`setpgid`
-leaves the group and is not reached by `kill_process_group`. On kernels whose Landlock ABI is older than V7
-(`PartiallyEnforced`), the rights and scopes they lack are not enforced,
-even with `require_enforcement`. A file created directly in a carved-out
-directory gets file rights only from the next spawn on. Hard links to
-files *inside* a denied directory are not searched for. With bare-pattern
-denies, each spawn does one `stat` per directory under the scanned roots
-(cached by mtime), synchronously.
+### Known limits
+
+- The network is not restricted.
+- **Carved-out directories (I1).** A directory that holds a denied entry
+  (often the project root, for `.env`) gets list and create rights only.
+  Within one spawn, a file or directory created directly in it has no
+  file rights yet: `echo a > new.txt` leaves an empty `new.txt` and fails,
+  `git init` leaves a partial `.git`, and a first `cargo build` cannot
+  write `Cargo.lock` or populate `target/`. The next spawn covers the new
+  entries, so a retry works. `rm`/`mv` of entries directly in such a
+  directory always fail; deeper, fully granted subdirectories are
+  unaffected.
+- **Kernel ABI.** On kernels whose Landlock ABI is older than V7
+  (`PartiallyEnforced`), the rights and scopes they lack are not enforced,
+  even with `require_enforcement`: below ABI 6 there are no signal or
+  abstract-socket scopes, below 3 `truncate()` outside the grants works.
+- Hard links to files *inside* a denied directory are not searched for.
+- With bare-pattern denies, each spawn does one `fstat` per directory under
+  the scanned roots (cached by mtime and ctime), synchronously; call
+  `confine()` from a blocking-capable context for very large trees. While
+  any denied file has more than one hard link, each spawn also does an
+  uncached walk of every file under those roots.
+- The private `TMPDIR` is shared by every spawn of one confiner, and it is
+  deleted when the confiner is dropped, even if a child is still running.
+  If the parent dies abnormally (`SIGKILL`, `panic = "abort"`) it is left
+  behind in the system temp dir as `aivyx-confine-*`.
+- With `allow_leaving_process_group`, a process that calls
+  `setsid`/`setpgid` is not reached by `kill_process_group`.
+- On 32-bit targets with the multiplexed `socketcall` syscall (i686), the
+  `socket(AF_UNIX)` rule can be bypassed through `socketcall`. No consumer
+  builds for such a target today; don't rely on the AF_UNIX block there.
+
+## Upgrading from `fd9f1b4`
+
+The existing API (`LandlockConfiner::new`, `default_confiner`) is
+unchanged; everything below is behaviour a consumer will notice.
+
+- **No local daemons.** `socket(AF_UNIX)` and AF_UNIX datagram
+  `socketpair()` fail with `EPERM`, and the session IPC variables are
+  removed. This breaks ssh-agent use (`git push` over ssh with an agent),
+  gpg signing (`git commit -S`), `docker`, `psql`/`mysql` over their
+  default sockets, git `credential-cache`/libsecret helpers, `systemctl
+  --user`, and any confined MCP server or tool that talks over a Unix
+  socket. Opt out per confiner with `allow_unix_sockets` (and accept that
+  the sandbox no longer contains code execution).
+- **No shared `/tmp`.** Writes go to a private `TMPDIR` instead; tools
+  that hard-code `/tmp` fail. Opt out with `share_system_tmp`.
+- **Process groups.** Confined commands lead their own process group, no
+  longer receive terminal signals (Ctrl-C) aimed at the caller's group,
+  and cannot `setsid`/`setpgid` (Python `start_new_session=True`, the
+  `setsid` tool, interactive job control) unless
+  `allow_leaving_process_group` is set. Callers should call
+  `kill_process_group(pgid)` when a tool call ends, times out or is
+  cancelled; neither consumer does yet.
+- **Signals.** Confined commands cannot signal the caller or processes
+  from earlier confined spawns (Landlock ABI 6+).
+- **No namespaces.** `clone` with `CLONE_NEW*` fails, `clone3` returns
+  `ENOSYS`, and the new mount API is blocked: rootless containers,
+  `bwrap` and Chromium's namespace sandbox don't work when confined.
+- **`deny_paths`.** Matched on every spawn (not once at construction),
+  relative multi-component entries resolve against `cwd`, hard-link
+  aliases are denied, symlinks in carved directories are never granted,
+  and carved directories lose remove/rename rights (see the I1 limit).
+- **Credential stores.** `~/.cargo/credentials(.toml)` and
+  `~/.config/git/credentials` are unreadable even with no `deny_paths`.
+- **Cost.** `confine()` now does filesystem work on every call when
+  bare-pattern denies are configured.
+- **New API.** `ConfineOptions` (fails closed by default:
+  `require_enforcement` is `true`), `LandlockConfiner::with_options`,
+  `default_confiner_with_options`, `kill_process_group`.
 
 Config-agnostic by design: every constructor takes plain primitives, no
 config-file parsing of its own. Each consumer's own config crate resolves

@@ -40,15 +40,18 @@ Single crate, no workspace — no `-p` flag needed. Single test:
 `target/test-fixtures`, never `/tmp`. Syscall-level tests re-exec the test
 binary as a confined helper (`helper_entry`, selected via
 `AIVYX_CONFINE_TEST_HELPER`). To build/test without the real
-Landlock/seccomp backend (e.g. on a non-Linux platform, or a kernel without Landlock):
+Landlock/seccomp backend (e.g. on a non-Linux platform, or a kernel
+without Landlock):
 `cargo build --no-default-features` / `cargo test --no-default-features`
 — `NoopConfiner`/`default_confiner`'s no-op arm are what's left.
 
 ## Architecture
 
 - `lib.rs` — the trait (`ExecutionConfiner`, including the
-  process-group contract), `NoopConfiner`, `ConfineOptions` (the opt-outs:
-  `allow_unix_sockets`, `share_system_tmp`), `default_confiner` /
+  process-group contract), `NoopConfiner`, `ConfineOptions` (fails closed
+  by default; the opt-outs: `allow_unix_sockets`, `share_system_tmp`,
+  `allow_leaving_process_group`), `kill_process_group` (a no-op without
+  the backend), `default_confiner` /
   `default_confiner_with_options` (feature-gated: `LandlockConfiner` when
   `sandbox-backend` is on, `NoopConfiner` otherwise), and the two shared
   path-classification helpers (`is_bare_pattern`, `is_basename_glob_match`)
@@ -70,13 +73,19 @@ Landlock/seccomp backend (e.g. on a non-Linux platform, or a kernel without Land
   `deny_paths` carve-outs: Landlock has no negative/deny rule, so a denied
   path nested inside a granted root is excluded by enumerating and
   re-granting only its unaffected siblings, never symlinks, while the
-  enumerated directory itself keeps directory-only rights (see `Grants`
-  and `grant_paths_excluding`). Bare patterns are found by a walk cached
-  per directory mtime; hard-link aliases and home credential stores are
-  added to the deny list. Seccomp is three stacked filters
-  (`build_seccomp_filters`): the `EPERM` denylist (incl. namespace
-  `clone` flags, the new mount API and, by default, `socket(AF_UNIX)`),
-  `clone3` → `ENOSYS`, and an x86_64 x32-number guard. The ruleset also
+  enumerated directory itself keeps list+create rights only — no
+  remove/rename, or a denied entry could be renamed out from under its
+  path-based deny (see `Grants`, `grant_paths_excluding`,
+  `carved_out_dir_write_access`). Every walk opens children relative to
+  the parent's fd with `O_NOFOLLOW`, and the ruleset is built from those
+  fds (`fd_rules`), never by re-resolving a path — a confined racer can
+  swap entries for symlinks. Bare patterns are found by a walk cached per
+  directory (dev, ino, mtime, ctime); hard-link aliases and home
+  credential stores are added to the deny list. Seccomp is three stacked
+  filters (`build_seccomp_filters`): the `EPERM` denylist (incl.
+  namespace `clone` flags, the new mount API and, by default,
+  `setsid`/`setpgid`, `socket(AF_UNIX)` and AF_UNIX datagram
+  `socketpair`), `clone3` → `ENOSYS`, and an x86_64 x32-number guard. The ruleset also
   requests Landlock's signal and abstract-socket scopes.
 
 ### The `ExecutionConfiner` contract
@@ -99,7 +108,9 @@ asks of callers).
 
 ## Where to look next
 
-- `README.md` — quick orientation and the design-doc pointer.
+- `README.md` — what is enforced, known limits, and the "Upgrading"
+  list of consumer-visible behaviour changes (keep it current when the
+  policy changes), plus the design-doc pointer.
 - `aivyx-ecosystem/docs/superpowers/specs/2026-08-16-aivyx-confine-design.md`
   — the full design: why this was extracted, and why `aivyx-coder`'s
   migration was part of the same project (unlike `aivyx-recall`/
