@@ -497,6 +497,25 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
+    /// Every test fixture lives under this crate's own `target/` directory,
+    /// never under `/tmp`: the system temp directory has historically been
+    /// write-granted to confined commands, so a fixture there could land
+    /// inside a grant by accident and make an "outside the sandbox"
+    /// assertion vacuous. Two fixture dirs from here are siblings, and
+    /// neither is inside any default grant.
+    fn fixture_root() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
+        std::fs::create_dir_all(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn fixture_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("fx-")
+            .tempdir_in(fixture_root())
+            .unwrap()
+    }
+
     fn confiner_for(dir: &Path) -> LandlockConfiner {
         LandlockConfiner::new(dir, &[], &[], true)
     }
@@ -521,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_inside_the_granted_root_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let confiner = confiner_for(dir.path());
         let target = dir.path().join("ok.txt");
 
@@ -536,13 +555,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_outside_the_granted_root_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        // Deliberately not another `tempfile::tempdir()`: those resolve
-        // under `/tmp`, which is itself write-granted (matching Codex's own
-        // choice to allow `/tmp` broadly) — both dirs would land inside the
-        // same grant. `/var/tmp` is a distinct, genuinely out-of-scope
-        // system tmp directory.
-        let outside = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        let dir = fixture_dir();
+        let outside = fixture_dir();
         let confiner = confiner_for(dir.path());
         let target = outside.path().join("should-not-exist.txt");
 
@@ -560,10 +574,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_outside_the_allowlist_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        // See `write_outside_the_granted_root_fails` for why `/var/tmp`
-        // rather than another `tempfile::tempdir()`.
-        let outside = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        let dir = fixture_dir();
+        let outside = fixture_dir();
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "top secret").unwrap();
         let confiner = confiner_for(dir.path());
@@ -579,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_of_an_allowlisted_path_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         std::fs::write(dir.path().join("readable.txt"), "hello").unwrap();
         let confiner = confiner_for(dir.path());
 
@@ -594,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_normal_command_still_works_under_the_seccomp_filter() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let confiner = confiner_for(dir.path());
 
         let mut command = tokio::process::Command::new("echo");
@@ -611,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_paths_entry_nested_inside_cwd_is_excluded_from_the_grant() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let secret_dir = dir.path().join("secret");
         std::fs::create_dir(&secret_dir).unwrap();
         std::fs::write(secret_dir.join("id_rsa"), "top secret").unwrap();
@@ -640,21 +652,21 @@ mod tests {
 
     #[test]
     fn grant_paths_excluding_returns_root_unchanged_when_nothing_is_denied() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let grants = grant_paths_excluding(dir.path(), &[]);
         assert_eq!(grants, vec![dir.path().to_path_buf()]);
     }
 
     #[test]
     fn grant_paths_excluding_returns_empty_when_root_itself_is_denied() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let grants = grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()]);
         assert!(grants.is_empty());
     }
 
     #[test]
     fn find_basename_glob_matches_finds_a_nested_match() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         std::fs::write(dir.path().join("nested/.env"), "SECRET=1").unwrap();
         std::fs::write(dir.path().join("public.txt"), "hello").unwrap();
@@ -666,7 +678,7 @@ mod tests {
 
     #[test]
     fn a_deny_paths_list_with_no_bare_entries_produces_no_matches() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
 
         // Every entry here has a path separator, so `deny_paths` has no
@@ -681,8 +693,8 @@ mod tests {
 
     #[test]
     fn find_basename_glob_matches_does_not_follow_a_symlinked_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let real_target = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
+        let real_target = fixture_dir();
         std::fs::write(real_target.path().join(".env"), "SECRET=1").unwrap();
         std::os::unix::fs::symlink(real_target.path(), dir.path().join("link")).unwrap();
 
@@ -693,7 +705,7 @@ mod tests {
 
     #[test]
     fn find_basename_glob_matches_does_not_descend_into_a_git_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".git/.env"), "SECRET=1").unwrap();
 
@@ -704,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bare_basename_pattern_nested_inside_cwd_is_excluded_from_the_grant() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
         std::fs::write(dir.path().join("public.txt"), "hello").unwrap();
 
@@ -727,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bare_basename_pattern_nested_inside_cwd_cannot_be_written_either() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
 
         let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
