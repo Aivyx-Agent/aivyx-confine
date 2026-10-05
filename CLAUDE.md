@@ -85,8 +85,8 @@ without Landlock):
   filters (`build_seccomp_filters`): the `EPERM` denylist (incl.
   namespace `clone` flags, the new mount API and, by default,
   `setsid`/`setpgid`, `socket(AF_UNIX)` and AF_UNIX datagram
-  `socketpair`), `clone3` → `ENOSYS`, and an x86_64 x32-number guard. The ruleset also
-  requests Landlock's signal and abstract-socket scopes.
+  `socketpair`), `clone3` → `ENOSYS`, and an x86_64 x32-number guard.
+  The ruleset also requests Landlock's signal and abstract-socket scopes.
 
 ### The `ExecutionConfiner` contract
 

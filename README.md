@@ -115,7 +115,9 @@ unchanged; everything below is behaviour a consumer will notice.
   longer receive terminal signals (Ctrl-C) aimed at the caller's group,
   and cannot `setsid`/`setpgid` (Python `start_new_session=True`, the
   `setsid` tool, interactive job control) unless
-  `allow_leaving_process_group` is set. Callers should call
+  `allow_leaving_process_group` is set. Git's background auto-maintenance
+  (`gc --auto` detaching after a commit) prints `fatal: setsid failed` and
+  skips that run; the command that triggered it still succeeds. Callers should call
   `kill_process_group(pgid)` when a tool call ends, times out or is
   cancelled; neither consumer does yet.
 - **Signals.** Confined commands cannot signal the caller or processes
