@@ -52,14 +52,16 @@ const DEFAULT_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin",
 /// confined `git` invocation on a machine with a global config would die.
 const DEFAULT_HOME_READ_PATHS: &[&str] = &[".cargo", ".rustup", ".gitconfig", ".config/git"];
 
-/// Plaintext credential stores that live inside `DEFAULT_HOME_READ_PATHS`:
-/// the crates.io token (current and legacy file names) and git's XDG
-/// credential-store file. Never readable by a confined command — see
-/// `resolve_deny_paths`.
+/// Plaintext credential stores under `$HOME`: the crates.io token (current
+/// and legacy file names) and git's credential-store files (the XDG one
+/// inside `DEFAULT_HOME_READ_PATHS`, and the default `~/.git-credentials`,
+/// reachable whenever `cwd` covers `$HOME`). Never readable by a confined
+/// command — see `resolve_deny_paths`.
 const HOME_CREDENTIAL_PATHS: &[&str] = &[
     ".cargo/credentials.toml",
     ".cargo/credentials",
     ".config/git/credentials",
+    ".git-credentials",
 ];
 
 /// Harmless character devices granted read+write. `/dev` is deliberately
@@ -2349,6 +2351,21 @@ mod tests {
         }
         assert!(cat_succeeds(&confiner, &cargo.join("bin/tool")).await);
         assert!(cat_succeeds(&confiner, &git.join("config")).await);
+    }
+
+    /// git's default credential-store file sits in `$HOME` itself, so it is
+    /// reachable whenever `cwd` covers `$HOME`.
+    #[tokio::test]
+    async fn the_git_credential_store_in_home_is_never_readable() {
+        let home = fixture_dir();
+        let store = home.path().join(".git-credentials");
+        std::fs::write(&store, "https://u:ghp-secret@github.com").unwrap();
+        std::fs::write(home.path().join("notes.txt"), "fine").unwrap();
+        let mut confiner = confiner_for(home.path());
+        confiner.set_home(home.path());
+
+        assert!(!cat_succeeds(&confiner, &store).await);
+        assert!(cat_succeeds(&confiner, &home.path().join("notes.txt")).await);
     }
 
     // --- Private temp directory (audit I7) ------------------------------

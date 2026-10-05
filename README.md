@@ -32,8 +32,8 @@ denied file that appears later is still denied.
   basename globs (`.env`, `*.pem`, matched anywhere under `cwd` and
   `extra_read_paths`) are carved out of every grant. Roots and entries are
   compared in canonical form. Hard-link aliases of a denied file under
-  those roots are denied too. `~/.cargo/credentials(.toml)` and
-  `~/.config/git/credentials` are always denied. A directory that had to
+  those roots are denied too. `~/.cargo/credentials(.toml)`,
+  `~/.config/git/credentials` and `~/.git-credentials` are always denied. A directory that had to
   be carved keeps only list and create rights, so `ls`, `touch` and
   `mkdir` work in it, but `rm` and `mv` of its direct entries do not (see
   the limits below).
@@ -157,8 +157,9 @@ unchanged; everything below is behaviour a consumer will notice.
   relative multi-component entries resolve against `cwd`, hard-link
   aliases are denied, symlinks in carved directories are never granted,
   and carved directories lose remove/rename rights (see the I1 limit).
-- **Credential stores.** `~/.cargo/credentials(.toml)` and
-  `~/.config/git/credentials` are unreadable even with no `deny_paths`.
+- **Credential stores.** `~/.cargo/credentials(.toml)`,
+  `~/.config/git/credentials` and `~/.git-credentials` are unreadable even
+  with no `deny_paths`.
 - **Cost.** `confine()` now does filesystem work on every call when
   bare-pattern denies are configured. It holds at most one descriptor
   per directory level while doing so, and if the process is out of
