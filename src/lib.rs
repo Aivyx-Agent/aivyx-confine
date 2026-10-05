@@ -94,7 +94,10 @@ pub struct ConfineOptions {
     /// ssh-agent, Wayland/X11 and `docker.sock`. Only set this when the
     /// confined commands genuinely need a local daemon, and accept that
     /// the sandbox no longer contains code execution in that case.
-    /// `socketpair()` keeps working either way.
+    /// Also opts out of the matching rule for `socketpair(AF_UNIX,
+    /// SOCK_DGRAM)` (an unconnected datagram end can `sendto()` any
+    /// pathname datagram socket, e.g. `/dev/log`). Stream and seqpacket
+    /// `socketpair()` keep working either way.
     pub allow_unix_sockets: bool,
     /// Opt back into the old temp-dir policy: read+write on the whole
     /// system temp directory (`/tmp`, and `$TMPDIR` if set). By default a

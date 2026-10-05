@@ -995,6 +995,9 @@ fn walk_dir_for_basename_matches(
     }
 }
 
+/// `SOCK_TYPE_MASK` from the kernel's `linux/net.h` (not in `libc`).
+const SOCK_TYPE_MASK: u64 = 0xf;
+
 /// `clone` flags that create a namespace. `unshare` is blocked outright,
 /// but `clone(CLONE_NEWUSER | SIGCHLD)` reaches the same kernel surface.
 const NAMESPACE_CLONE_FLAGS: &[libc::c_int] = &[
@@ -1019,8 +1022,8 @@ const CLONE_FLAGS_ARG: u8 = 0;
 /// without interfering:
 ///
 /// 1. The denylist (`BLOCKED_SYSCALLS`, namespace-creating `clone`,
-///    `setsid`/`setpgid` and `socket(AF_UNIX)` unless opted out) →
-///    `EPERM`.
+///    `setsid`/`setpgid`, and `socket(AF_UNIX)` plus
+///    `socketpair(AF_UNIX, SOCK_DGRAM)` unless opted out) → `EPERM`.
 /// 2. `clone3` → `ENOSYS`. Its flags live in a user-memory struct seccomp
 ///    cannot inspect, so it can't be filtered like `clone`; `ENOSYS` makes
 ///    glibc and others fall back to plain `clone`, which is filtered.
@@ -1113,6 +1116,34 @@ fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
         // D-Bus session bus (`systemd-run --user` runs arbitrary code
         // unconfined), gpg-agent, ssh-agent, Wayland/X11 and docker.sock.
         // `socketpair()` is a different syscall and stays allowed.
+        // An unconnected datagram `socketpair` end can still `sendto()`
+        // any pathname datagram socket (journald, `/dev/log`), so the
+        // `SOCK_DGRAM` variant is refused too. Stream and seqpacket pairs
+        // are connection-oriented and stay allowed.
+        rules.insert(
+            libc::SYS_socketpair,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        libc::AF_UNIX as u64,
+                    )
+                    .expect("static seccomp condition is well-formed"),
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        // The low bits are the type; the rest are
+                        // SOCK_CLOEXEC/SOCK_NONBLOCK flags.
+                        SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                        libc::SOCK_DGRAM as u64,
+                    )
+                    .expect("static seccomp condition is well-formed"),
+                ])
+                .expect("static seccomp rule is well-formed"),
+            ],
+        );
         rules.insert(
             libc::SYS_socket,
             vec![
@@ -1383,6 +1414,34 @@ mod tests {
                     libc::close(fd);
                     (ret as i64, errno)
                 }
+                "dgram_sendto" => {
+                    let mut fds = [0; 2];
+                    let ret = libc::socketpair(
+                        libc::AF_UNIX,
+                        libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                        0,
+                        fds.as_mut_ptr(),
+                    );
+                    if ret < 0 {
+                        return (ret as i64, last_errno());
+                    }
+                    let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                    for (i, b) in arg.as_bytes().iter().enumerate() {
+                        addr.sun_path[i] = *b as libc::c_char;
+                    }
+                    let len = std::mem::size_of::<libc::sa_family_t>() + arg.len();
+                    let msg = b"from-sandbox";
+                    let ret = libc::sendto(
+                        fds[0],
+                        msg.as_ptr().cast(),
+                        msg.len(),
+                        0,
+                        &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                        len as libc::socklen_t,
+                    );
+                    (ret as i64, last_errno())
+                }
                 "socketpair" => {
                     let mut fds = [0; 2];
                     let ret =
@@ -1526,6 +1585,27 @@ mod tests {
         let (ret, errno) = run_helper(&confiner, "socketpair", "").await;
 
         assert_eq!(ret, 0, "socketpair failed with errno {errno}");
+    }
+
+    #[tokio::test]
+    async fn an_unconnected_datagram_socketpair_cannot_reach_an_outside_socket() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        let socket_path = outside.path().join("log.sock");
+        let listener = std::os::unix::net::UnixDatagram::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &helper_read_paths(), &[], true);
+
+        let (ret, errno) =
+            run_helper(&confiner, "dgram_sendto", socket_path.to_str().unwrap()).await;
+
+        let mut buf = [0u8; 64];
+        assert!(
+            listener.recv(&mut buf).is_err(),
+            "datagram reached the outside socket"
+        );
+        assert!(ret < 0);
+        assert_eq!(errno, libc::EPERM);
     }
 
     #[tokio::test]

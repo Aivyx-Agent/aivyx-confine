@@ -45,7 +45,9 @@ denied file that appears later is still denied.
   `ConfineOptions::allow_unix_sockets` is set, because Landlock does not
   gate `connect()` to an existing Unix socket: the D-Bus session bus alone
   (`systemd-run --user`) would be unconfined code execution.
-  `socketpair()` keeps working.
+  Stream and seqpacket `socketpair()` keep working; a `SOCK_DGRAM`
+  `socketpair()` is refused too (unless opted out), since an unconnected
+  datagram end can `sendto()` any pathname datagram socket (`/dev/log`).
 - **Landlock scopes (kernel ABI 6+):** no signals to processes outside the
   sandbox, and no connections to abstract Unix sockets outside it.
 - **Environment:** `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`,
