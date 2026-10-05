@@ -283,9 +283,9 @@ pub struct LandlockConfiner {
     /// re-read on every spawn. See `walk_for_basename_matches`.
     scan_cache: std::sync::Mutex<ScanCache>,
     home: Option<PathBuf>,
-    /// The temp-dir policy: `None` with `share_system_tmp`, otherwise the
-    /// private directory (itself `None` if it could not be created, in
-    /// which case no temp directory is writable at all).
+    /// The temp-dir policy: `Shared` with `share_system_tmp`, otherwise the
+    /// private directory (`None` if it could not be created, in which case
+    /// no temp directory is writable at all).
     tmp: TmpPolicy,
     /// Installed in order in the child; see `build_seccomp_filters`.
     seccomp_programs: Vec<BpfProgram>,
@@ -1013,6 +1013,14 @@ impl ExecutionConfiner for LandlockConfiner {
                     // found via CI failing outright on GitHub's runner
                     // kernel, which lands on `PartiallyEnforced` for this
                     // ABI target.
+                    //
+                    // This is a real, accepted weakening: every right or
+                    // scope the kernel doesn't know is simply not
+                    // enforced. On ABI < 3 `truncate()` outside the grants
+                    // is unrestricted; < 4 has no network rules (unused
+                    // here anyway); < 5 leaves device ioctls open; < 6
+                    // drops the signal and abstract-socket scopes. The
+                    // seccomp layer does not depend on the ABI.
                     if require_enforcement && status.ruleset == RulesetStatus::NotEnforced {
                         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                     }

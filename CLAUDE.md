@@ -36,33 +36,48 @@ cargo fmt
 ```
 
 Single crate, no workspace — no `-p` flag needed. Single test:
-`cargo test <test_name>`. To build/test without the real Landlock/seccomp
-backend (e.g. on a non-Linux platform, or a kernel without Landlock):
+`cargo test <test_name>`. Test fixtures live under
+`target/test-fixtures`, never `/tmp`. Syscall-level tests re-exec the test
+binary as a confined helper (`helper_entry`, selected via
+`AIVYX_CONFINE_TEST_HELPER`). To build/test without the real
+Landlock/seccomp backend (e.g. on a non-Linux platform, or a kernel without Landlock):
 `cargo build --no-default-features` / `cargo test --no-default-features`
 — `NoopConfiner`/`default_confiner`'s no-op arm are what's left.
 
 ## Architecture
 
-- `lib.rs` — the trait (`ExecutionConfiner`), `NoopConfiner`,
-  `default_confiner` (feature-gated: `LandlockConfiner` when
+- `lib.rs` — the trait (`ExecutionConfiner`, including the
+  process-group contract), `NoopConfiner`, `ConfineOptions` (the opt-outs:
+  `allow_unix_sockets`, `share_system_tmp`), `default_confiner` /
+  `default_confiner_with_options` (feature-gated: `LandlockConfiner` when
   `sandbox-backend` is on, `NoopConfiner` otherwise), and the two shared
   path-classification helpers (`is_bare_pattern`, `is_basename_glob_match`)
-  — used by both `confiner.rs`'s own `find_basename_glob_matches` and, in
-  `aivyx-coder`, `aivyx-sandbox`'s unrelated `ConfirmationGate::is_denied`
+  — `is_bare_pattern` is used by `LandlockConfiner` (splitting
+  `deny_paths` into bare patterns and real paths; the patterns are then
+  compiled into one `GlobSet` with the same semantics as
+  `is_basename_glob_match`), and both are used, in `aivyx-coder`, by
+  `aivyx-sandbox`'s unrelated `ConfirmationGate::is_denied`
   / `path_is_denied`. That second consumer is *not* about process
   confinement at all (it gates permission decisions) — it just happens to
   need the identical "is this a basename-glob pattern or a real path"
   classification, which is why these two small functions are `pub` here
   rather than private to `confiner.rs`.
-- `confiner.rs` — `LandlockConfiner`, the real backend: fixed
-  system/toolchain read grants, cwd + `extra_read_paths` write grants, a
-  handful of `/dev/{null,zero,urandom,random}` device grants, `deny_paths`
-  carve-outs (Landlock has no negative/deny rule, so a denied path nested
-  inside a granted root is excluded by enumerating and re-granting only
-  its unaffected siblings — see `grant_paths_excluding`'s own doc
-  comment), and a seccomp-bpf denylist (`ptrace`, `io_uring_*`, `mount`,
-  `bpf`, `unshare`, `setns`, `perf_event_open`, etc. — defense-in-depth
-  compensating for not using Linux namespaces).
+- `confiner.rs` — `LandlockConfiner`, the real backend, and
+  `kill_process_group`. Grants are computed in `compute_grants` on every
+  `confine()` call: fixed system/toolchain read grants plus `cwd` and
+  `extra_read_paths` (read-only); write grants on `cwd` and a private,
+  per-confiner `TMPDIR` only; `/dev/{null,zero,urandom,random}`.
+  `deny_paths` carve-outs: Landlock has no negative/deny rule, so a denied
+  path nested inside a granted root is excluded by enumerating and
+  re-granting only its unaffected siblings, never symlinks, while the
+  enumerated directory itself keeps directory-only rights (see `Grants`
+  and `grant_paths_excluding`). Bare patterns are found by a walk cached
+  per directory mtime; hard-link aliases and home credential stores are
+  added to the deny list. Seccomp is three stacked filters
+  (`build_seccomp_filters`): the `EPERM` denylist (incl. namespace
+  `clone` flags, the new mount API and, by default, `socket(AF_UNIX)`),
+  `clone3` → `ENOSYS`, and an x86_64 x32-number guard. The ruleset also
+  requests Landlock's signal and abstract-socket scopes.
 
 ### The `ExecutionConfiner` contract
 
@@ -75,7 +90,12 @@ post-fork, pre-exec, under async-signal-safety constraints (no
 allocation, no locks) — every error path inside it uses an
 `ErrorKind`-based `io::Error`, never `.to_string()`/`io::Error::other`
 (both allocate). All ruleset/filter construction happens in the parent,
-before fork, for exactly this reason.
+before fork, for exactly this reason — including the per-spawn grant
+computation, which walks the filesystem when bare-pattern denies are
+configured, so `confine()` itself can block briefly. `confine()` also
+scrubs session-IPC env vars, sets `TMPDIR` to the private temp dir and
+puts the command in a new process group (see the trait doc for what that
+asks of callers).
 
 ## Where to look next
 
