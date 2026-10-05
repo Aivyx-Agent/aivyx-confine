@@ -41,7 +41,7 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 /// the one grant that can't stay narrow (the working directory, which must
 /// be granted wholesale to be useful), `grant_paths_excluding` below does
 /// the carve-out properly instead of ignoring the problem.
-/// Nonexistent paths are silently skipped by `Grants::push_root`, so it's
+/// Nonexistent paths are silently skipped by `grant_root_whole`, so it's
 /// safe to list toolchain paths that may not exist on a given system.
 const DEFAULT_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
@@ -55,7 +55,7 @@ const DEFAULT_HOME_READ_PATHS: &[&str] = &[".cargo", ".rustup", ".gitconfig", ".
 /// Plaintext credential stores that live inside `DEFAULT_HOME_READ_PATHS`:
 /// the crates.io token (current and legacy file names) and git's XDG
 /// credential-store file. Never readable by a confined command — see
-/// `compute_grants`.
+/// `resolve_deny_paths`.
 const HOME_CREDENTIAL_PATHS: &[&str] = &[
     ".cargo/credentials.toml",
     ".cargo/credentials",
@@ -367,23 +367,24 @@ impl LandlockConfiner {
         }
     }
 
-    /// Computes the read and write grants from the current filesystem
-    /// state. Runs in the parent, before fork, on every `confine()`.
-    fn compute_grants(&self) -> (Grants, Grants) {
+    /// Resolves the deny list against the current filesystem state: the
+    /// canonical `cwd`, the `extra_read_paths` roots, and every path to
+    /// carve out. Runs in the parent, before fork, on every `confine()`.
+    fn resolve_deny_paths(&self) -> Result<(PathBuf, Vec<PathBuf>, Vec<PathBuf>), FdExhausted> {
         // Bare deny_paths patterns (e.g. `.env`) are resolved into
         // concrete file paths by scanning every project-relevant root —
         // `cwd` and each `extra_read_paths` entry, the roots a project's
         // own secrets could plausibly live under. The combined result is
-        // reused for *every* grant computation below, including the fixed
-        // system paths and the temp directory: any of them could, in
-        // principle, be an ancestor of a project-relevant root (an
-        // `/etc/nixos`-style system-config-as-project-repo, or `cwd`
-        // nested inside the system temp dir) and would otherwise silently
-        // re-grant whatever that root's own narrower carve-out just
-        // excluded. Passing the same fully-resolved list to every
-        // `grant_paths_excluding` call is safe, not overly permissive —
-        // that function only ever acts on entries actually nested under
-        // the specific root it's given.
+        // reused for *every* grant below, including the fixed system
+        // paths and the temp directory: any of them could, in principle,
+        // be an ancestor of a project-relevant root (an `/etc/nixos`-style
+        // system-config-as-project-repo, or `cwd` nested inside the system
+        // temp dir) and would otherwise silently re-grant whatever that
+        // root's own narrower carve-out just excluded. Passing the same
+        // fully-resolved list to every `grant_paths_excluding` call is
+        // safe, not overly permissive — that function only ever acts on
+        // entries actually nested under the specific root it's given.
+        //
         // Carve-outs match lexically (`Path::starts_with`), so roots and
         // deny entries are compared in canonical form: a non-canonical
         // `cwd` (reached through a symlink) or a deny entry given through
@@ -392,10 +393,18 @@ impl LandlockConfiner {
         // relative to `cwd`. Both the given and the canonical form of each
         // entry are kept; the extra one is harmless.
         let cwd = canonical_or_given(&self.cwd);
+        // An `extra_read_paths` entry inside `cwd` is *not* canonicalised:
+        // a confined command can replace it with a symlink, and resolving
+        // that would grant the symlink's target. It is kept lexical
+        // (re-anchored on the canonical `cwd`) and opened component by
+        // component with `O_NOFOLLOW` (`open_root`).
         let extra_read_paths: Vec<PathBuf> = self
             .extra_read_paths
             .iter()
-            .map(|p| canonical_or_given(p))
+            .map(|p| match lexically_inside(p, &self.cwd, &cwd) {
+                Some(rest) => cwd.join(rest),
+                None => canonical_or_given(p),
+            })
             .collect();
         let mut resolved_deny_paths = Vec::with_capacity(self.deny_paths.len() * 2);
         for entry in &self.deny_paths {
@@ -432,13 +441,14 @@ impl LandlockConfiner {
             let mut next = ScanCache::new();
             for root in std::iter::once(&cwd).chain(&extra_read_paths) {
                 walk_for_basename_matches(
+                    &cwd,
                     root,
                     self.scan_settle_secs,
                     patterns,
                     &mut cache,
                     &mut next,
                     &mut resolved_deny_paths,
-                );
+                )?;
             }
             *cache = next;
         }
@@ -451,53 +461,55 @@ impl LandlockConfiner {
         let linked_inodes = multiply_linked_inodes(&resolved_deny_paths);
         if !linked_inodes.is_empty() {
             for root in std::iter::once(&cwd).chain(&extra_read_paths) {
-                find_hardlink_aliases(root, &linked_inodes, &mut resolved_deny_paths);
+                find_hardlink_aliases(&cwd, root, &linked_inodes, &mut resolved_deny_paths)?;
             }
         }
+        Ok((cwd, extra_read_paths, resolved_deny_paths))
+    }
 
-        // `grant_paths_excluding` is applied uniformly to every candidate
-        // root. It grants the root whole whenever nothing is nested
-        // underneath, so this costs nothing extra in the common case.
-        let mut read_candidates: Vec<PathBuf> =
-            DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
+    /// Adds every grant to `sink`, one rule per opened fd, closing each fd
+    /// as soon as its rule is added — so the descriptors held at any
+    /// moment are bounded by directory depth, not by how many entries a
+    /// carve-out enumerates. Read-only roots get `Level::read()`; `cwd`,
+    /// the temp dir(s) and the devices get `Level::write()` (which
+    /// includes reading).
+    fn add_grants(
+        &self,
+        cwd: &Path,
+        extra_read_paths: &[PathBuf],
+        deny_paths: &[PathBuf],
+        sink: &mut dyn RuleSink,
+    ) -> Result<(), BuildError> {
+        let mut read_roots: Vec<PathBuf> = DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
         if let Some(home) = &self.home {
-            read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
+            read_roots.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
         }
-        read_candidates.push(cwd.clone());
-        read_candidates.extend(extra_read_paths.iter().cloned());
-        let mut read_grants = Grants::default();
-        for root in &read_candidates {
-            grant_paths_excluding(root, &resolved_deny_paths, &mut read_grants);
-        }
-        // Read side of the device grants below (read and write rules are
-        // separate Landlock rule sets, so both lists need the entries).
-        for device in DEVICE_RW_PATHS {
-            read_grants.push_root(Path::new(device));
+        read_roots.extend(extra_read_paths.iter().cloned());
+        for root in &read_roots {
+            grant_paths_excluding(cwd, root, deny_paths, Level::read(), sink)?;
         }
 
-        let mut write_candidates = vec![cwd.clone()];
+        let mut write_roots = vec![cwd.to_path_buf()];
         match &self.tmp {
             TmpPolicy::Shared => {
-                write_candidates.push(std::env::temp_dir());
+                write_roots.push(std::env::temp_dir());
                 if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-                    write_candidates.push(PathBuf::from(tmpdir));
+                    write_roots.push(PathBuf::from(tmpdir));
                 }
             }
-            TmpPolicy::Private(Some(dir)) => write_candidates.push(dir.path().to_path_buf()),
+            TmpPolicy::Private(Some(dir)) => write_roots.push(dir.path().to_path_buf()),
             TmpPolicy::Private(None) => {}
         }
-        let mut write_grants = Grants::default();
-        for root in &write_candidates {
-            grant_paths_excluding(root, &resolved_deny_paths, &mut write_grants);
+        for root in &write_roots {
+            grant_paths_excluding(cwd, root, deny_paths, Level::write(), sink)?;
         }
         // Individual device files, not subject to deny_paths carve-outs
-        // (they're fixed, well-known, and content-free); `push_root` silently
-        // skips any that don't exist.
+        // (they're fixed, well-known, and content-free); missing ones are
+        // skipped.
         for device in DEVICE_RW_PATHS {
-            write_grants.push_root(Path::new(device));
+            grant_root_whole(cwd, Path::new(device), Level::write(), sink)?;
         }
-
-        (read_grants, write_grants)
+        Ok(())
     }
 
     /// Builds the full ruleset here, in the parent process, before `fork()`
@@ -506,11 +518,9 @@ impl LandlockConfiner {
     /// forked child under async-signal-safety constraints (no allocation,
     /// no locks). `RulesetCreated::restrict_self()` itself is verified to
     /// be a thin syscall wrapper over this already-built state.
-    fn build_ruleset(
-        read_grants: &Grants,
-        write_grants: &Grants,
-    ) -> Result<RulesetCreated, landlock::RulesetError> {
-        Ruleset::default()
+    fn build_ruleset(&self) -> Result<RulesetCreated, BuildError> {
+        let (cwd, extra_read_paths, deny_paths) = self.resolve_deny_paths()?;
+        let mut ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(LANDLOCK_ABI))?
             // Signals and abstract Unix sockets may not cross the sandbox
             // boundary: without this a confined command can kill any of
@@ -519,87 +529,125 @@ impl LandlockConfiner {
             // covers. Needs ABI 6; silently skipped on older kernels
             // (best-effort compatibility, as for every other right).
             .scope(Scope::from_all(LANDLOCK_ABI))?
-            .create()?
-            .add_rules(fd_rules(
-                &read_grants.full,
-                AccessFs::from_read(LANDLOCK_ABI),
-            ))?
-            .add_rules(fd_rules(&read_grants.dir_only, AccessFs::ReadDir.into()))?
-            .add_rules(fd_rules(
-                &write_grants.full,
-                AccessFs::from_all(LANDLOCK_ABI),
-            ))?
-            .add_rules(fd_rules(
-                &write_grants.dir_only,
-                carved_out_dir_write_access(),
-            ))
+            .create()?;
+        self.add_grants(&cwd, &extra_read_paths, &deny_paths, &mut ruleset)?;
+        Ok(ruleset)
     }
 }
 
-/// Landlock rules for `grants`, built from their already-open fds.
-/// Non-directories get only the file subset of `access` (Landlock rejects
-/// directory rights on a file).
-fn fd_rules(
-    grants: &[Grant],
-    access: landlock::BitFlags<AccessFs>,
-) -> impl Iterator<Item = Result<PathBeneath<BorrowedFd<'_>>, landlock::RulesetError>> {
-    grants.iter().map(move |grant| {
-        let access = if grant.is_dir {
+/// Running out of file descriptors (`EMFILE`/`ENFILE`) while computing
+/// grants. Unlike a kernel without Landlock, this can be caused by a
+/// repository's contents (enough entries to enumerate), so it is never a
+/// reason to run with less confinement — see `confine_with_ruleset`.
+#[derive(Debug)]
+struct FdExhausted;
+
+fn is_fd_exhaustion(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+/// Why the ruleset could not be built.
+#[derive(Debug)]
+enum BuildError {
+    /// See `FdExhausted`: always fails closed.
+    Exhausted,
+    /// Landlock itself refused (e.g. unsupported kernel): fails closed
+    /// only under `require_enforcement`.
+    Landlock(landlock::RulesetError),
+    /// Test hook standing in for `Landlock`.
+    #[cfg(test)]
+    Forced,
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted => f.write_str("out of file descriptors (EMFILE/ENFILE)"),
+            Self::Landlock(err) => write!(f, "{err}"),
+            #[cfg(test)]
+            Self::Forced => f.write_str("forced by test"),
+        }
+    }
+}
+
+impl From<FdExhausted> for BuildError {
+    fn from(_: FdExhausted) -> Self {
+        Self::Exhausted
+    }
+}
+
+impl From<landlock::RulesetError> for BuildError {
+    /// A ruleset error caused by descriptor exhaustion (creating the
+    /// ruleset fd) is `Exhausted`, not `Landlock`.
+    fn from(err: landlock::RulesetError) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        while let Some(current) = source {
+            if let Some(io_err) = current.downcast_ref::<io::Error>()
+                && is_fd_exhaustion(io_err)
+            {
+                return Self::Exhausted;
+            }
+            source = current.source();
+        }
+        Self::Landlock(err)
+    }
+}
+
+/// Where grants go: the real ruleset, or (in tests) a recorder.
+trait RuleSink {
+    /// Adds a rule for the inode open on `fd`. `path` is only a label.
+    fn add(
+        &mut self,
+        path: &Path,
+        fd: BorrowedFd<'_>,
+        is_dir: bool,
+        access: landlock::BitFlags<AccessFs>,
+    ) -> Result<(), BuildError>;
+}
+
+impl RuleSink for RulesetCreated {
+    fn add(
+        &mut self,
+        _path: &Path,
+        fd: BorrowedFd<'_>,
+        is_dir: bool,
+        access: landlock::BitFlags<AccessFs>,
+    ) -> Result<(), BuildError> {
+        // Landlock rejects directory rights on a non-directory.
+        let access = if is_dir {
             access
         } else {
             access & AccessFs::from_file(LANDLOCK_ABI)
         };
-        Ok(PathBeneath::new(grant.fd.as_fd(), access))
-    })
+        self.add_rule(PathBeneath::new(fd, access))?;
+        Ok(())
+    }
 }
 
-/// Grants computed for one access level (read, or read+write).
-/// `full` paths get that level's whole access set beneath them.
-/// `dir_only` paths are directories that had to be enumerated to carve a
-/// denied entry out of them: they get only directory-level rights (list,
-/// create entries), never file rights, because file rights
-/// on a directory would apply to every file beneath it — including the
-/// denied one.
-///
-/// Every grant holds the fd it was opened through, and the ruleset is
-/// built from those fds (`PathBeneath::new(fd, ..)`), never by resolving
-/// `path` again: a confined racer can swap an entry for a symlink between
-/// enumeration and ruleset construction, and a by-path reopen would then
-/// attach the rule to the symlink's target. `path` is only a label (for
-/// deny matching and tests).
-#[derive(Debug, Default)]
-struct Grants {
-    full: Vec<Grant>,
-    dir_only: Vec<Grant>,
+/// The access sets one root is granted with. `full` is for whole
+/// subtrees; `dir_only` is for directories that had to be enumerated to
+/// carve a denied entry out of them — directory-level rights only, never
+/// file rights, because file rights on a directory would apply to every
+/// file beneath it, including the denied one.
+#[derive(Clone, Copy)]
+struct Level {
+    full: landlock::BitFlags<AccessFs>,
+    dir_only: landlock::BitFlags<AccessFs>,
 }
 
-#[derive(Debug)]
-struct Grant {
-    /// A label only (see `Grants`); read by `Debug` output and tests.
-    #[cfg_attr(not(test), allow(dead_code))]
-    path: PathBuf,
-    fd: OwnedFd,
-    is_dir: bool,
-}
-
-impl Grants {
-    /// Grants `path` whole, resolving it (following symlinks) — only for
-    /// the fixed roots handed in by the consumer or this crate, never for
-    /// an enumerated child.
-    fn push_root(&mut self, path: &Path) {
-        if let Some(fd) = open_path(path, libc::O_PATH | libc::O_CLOEXEC) {
-            let is_dir = fd_is_dir(fd.as_fd());
-            self.full.push(Grant {
-                path: path.to_path_buf(),
-                fd,
-                is_dir,
-            });
+impl Level {
+    fn read() -> Self {
+        Self {
+            full: AccessFs::from_read(LANDLOCK_ABI),
+            dir_only: AccessFs::ReadDir.into(),
         }
     }
 
-    #[cfg(test)]
-    fn full_paths(&self) -> Vec<PathBuf> {
-        self.full.iter().map(|g| g.path.clone()).collect()
+    fn write() -> Self {
+        Self {
+            full: AccessFs::from_all(LANDLOCK_ABI),
+            dir_only: carved_out_dir_write_access(),
+        }
     }
 }
 
@@ -607,33 +655,107 @@ fn cstring(bytes: &[u8]) -> Option<std::ffi::CString> {
     std::ffi::CString::new(bytes).ok()
 }
 
-/// `open(path, flags)`; `None` on any failure.
-fn open_path(path: &Path, flags: libc::c_int) -> Option<OwnedFd> {
-    let path = cstring(path.as_os_str().as_bytes())?;
-    // SAFETY: valid NUL-terminated path; the returned fd is owned below.
-    let fd = unsafe { libc::open(path.as_ptr(), flags) };
-    // SAFETY: `fd` is a freshly opened descriptor nobody else owns.
-    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+/// What an open attempt produced: `Ok(Some(fd))`, `Ok(None)` for any
+/// failure other than descriptor exhaustion (the caller skips the entry,
+/// failing toward less access), or `Err(FdExhausted)`.
+type Opened = Result<Option<OwnedFd>, FdExhausted>;
+
+fn opened(fd: libc::c_int) -> Opened {
+    if fd >= 0 {
+        // SAFETY: `fd` is a freshly opened descriptor nobody else owns.
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
+    if is_fd_exhaustion(&io::Error::last_os_error()) {
+        return Err(FdExhausted);
+    }
+    Ok(None)
 }
 
-/// `openat(dir, name, flags)` for a single path component; `None` on any
-/// failure. With `O_NOFOLLOW` nothing is resolved through a symlink.
-fn open_at(dir: BorrowedFd<'_>, name: &OsStr, flags: libc::c_int) -> Option<OwnedFd> {
-    let name = cstring(name.as_bytes())?;
-    // SAFETY: valid dirfd and NUL-terminated name; the fd is owned below.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-    // SAFETY: `fd` is a freshly opened descriptor nobody else owns.
-    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+/// `open(path, flags)`.
+fn open_path(path: &Path, flags: libc::c_int) -> Opened {
+    let Some(path) = cstring(path.as_os_str().as_bytes()) else {
+        return Ok(None);
+    };
+    // SAFETY: valid NUL-terminated path.
+    opened(unsafe { libc::open(path.as_ptr(), flags) })
+}
+
+/// `openat(dir, name, flags)` for a single path component. With
+/// `O_NOFOLLOW` nothing is resolved through a symlink.
+fn open_at(dir: BorrowedFd<'_>, name: &OsStr, flags: libc::c_int) -> Opened {
+    let Some(name) = cstring(name.as_bytes()) else {
+        return Ok(None);
+    };
+    // SAFETY: valid dirfd and NUL-terminated name.
+    opened(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) })
 }
 
 /// Opens a directory entry of `dir` as a directory to read, refusing
 /// symlinks.
-fn open_subdir(dir: BorrowedFd<'_>, name: &OsStr) -> Option<OwnedFd> {
+fn open_subdir(dir: BorrowedFd<'_>, name: &OsStr) -> Opened {
     open_at(
         dir,
         name,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
     )
+}
+
+/// `path` relative to `cwd`, if `path` is lexically inside it — as given
+/// (`given_cwd`) or in canonical form (`canonical_cwd`) — and not `cwd`
+/// itself. Only plain components count; anything with `..` is "not
+/// inside".
+fn lexically_inside<'a>(
+    path: &'a Path,
+    given_cwd: &Path,
+    canonical_cwd: &Path,
+) -> Option<&'a Path> {
+    let rest = path
+        .strip_prefix(canonical_cwd)
+        .or_else(|_| path.strip_prefix(given_cwd))
+        .ok()?;
+    let plain = rest
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (plain && !rest.as_os_str().is_empty()).then_some(rest)
+}
+
+/// Opens a grant root. A root inside `cwd` (whose entries a confined
+/// command controls) is opened from `cwd`'s fd one component at a time
+/// with `O_NOFOLLOW`, so a symlink planted anywhere along it — including
+/// as the root itself — makes the open fail instead of being followed.
+/// Any other root is a fixed system, home or temp path, or `cwd` itself,
+/// none of which a confined command can replace, and is opened by path.
+fn open_root(cwd: &Path, root: &Path, flags: libc::c_int) -> Opened {
+    let Some(rest) = lexically_inside(root, cwd, cwd) else {
+        return open_path(root, flags);
+    };
+    let Some(mut dir) = open_path(cwd, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)? else {
+        return Ok(None);
+    };
+    let mut components = rest.components().peekable();
+    while let Some(component) = components.next() {
+        let name = component.as_os_str();
+        if components.peek().is_none() {
+            let Some(fd) = open_at(dir.as_fd(), name, flags | libc::O_NOFOLLOW)? else {
+                return Ok(None);
+            };
+            // `O_PATH | O_NOFOLLOW` opens a symlink itself; refuse it.
+            if fd_stat(fd.as_fd()).is_none_or(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK) {
+                return Ok(None);
+            }
+            return Ok(Some(fd));
+        }
+        let Some(next) = open_at(
+            dir.as_fd(),
+            name,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?
+        else {
+            return Ok(None);
+        };
+        dir = next;
+    }
+    Ok(None)
 }
 
 fn fd_stat(fd: BorrowedFd<'_>) -> Option<libc::stat> {
@@ -649,18 +771,28 @@ fn fd_is_dir(fd: BorrowedFd<'_>) -> bool {
 
 /// The entries of the directory open on `dir` (minus `.`/`..`), with
 /// their `d_type` (`DT_UNKNOWN` on filesystems that don't report it).
-fn dir_entries(dir: BorrowedFd<'_>) -> Vec<(OsString, u8)> {
+/// Holds one extra descriptor only while reading.
+fn dir_entries(dir: BorrowedFd<'_>) -> Result<Vec<(OsString, u8)>, FdExhausted> {
     // SAFETY: duplicating a valid fd; ownership passes to `fdopendir`.
     let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if dup < 0 {
-        return Vec::new();
+        return if is_fd_exhaustion(&io::Error::last_os_error()) {
+            Err(FdExhausted)
+        } else {
+            Ok(Vec::new())
+        };
     }
     // SAFETY: `dup` is a valid directory fd we own.
     let stream = unsafe { libc::fdopendir(dup) };
     if stream.is_null() {
+        let exhausted = is_fd_exhaustion(&io::Error::last_os_error());
         // SAFETY: `fdopendir` failed, so `dup` is still ours to close.
         unsafe { libc::close(dup) };
-        return Vec::new();
+        return if exhausted {
+            Err(FdExhausted)
+        } else {
+            Ok(Vec::new())
+        };
     }
     let mut entries = Vec::new();
     // SAFETY: `stream` is a valid DIR*; the dup shares its offset with
@@ -688,7 +820,7 @@ fn dir_entries(dir: BorrowedFd<'_>) -> Vec<(OsString, u8)> {
     }
     // SAFETY: closes the stream and `dup` with it.
     unsafe { libc::closedir(stream) };
-    entries
+    Ok(entries)
 }
 
 /// Directory-level rights for a carved-out directory in the write set:
@@ -718,29 +850,54 @@ fn carved_out_dir_write_access() -> landlock::BitFlags<AccessFs> {
         | AccessFs::MakeSock
 }
 
+/// Grants `root` whole at `level.full` — only for roots handed in by the
+/// consumer or this crate (see `open_root`), never for an enumerated
+/// child. A root that doesn't exist is skipped.
+fn grant_root_whole(
+    cwd: &Path,
+    root: &Path,
+    level: Level,
+    sink: &mut dyn RuleSink,
+) -> Result<(), BuildError> {
+    if let Some(fd) = open_root(cwd, root, libc::O_PATH | libc::O_CLOEXEC)? {
+        sink.add(root, fd.as_fd(), fd_is_dir(fd.as_fd()), level.full)?;
+    }
+    Ok(())
+}
+
 /// Landlock has no negative/deny rule — a domain can only ever be *more*
 /// restricted than ambient, never "grant X except Y". To grant `root`
 /// wholesale while still excluding a `deny_paths` entry nested somewhere
 /// inside it, enumerate `root`'s direct children and grant each
 /// individually: recurse into any child that itself contains a denial
 /// further down, and skip entirely any child that *is* a denial. The
-/// enumerated directory itself goes into `grants.dir_only` (see `Grants`).
-/// When nothing under `root` is denied (the common case), `root` is
-/// granted whole with no extra filesystem work.
-fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grants) {
+/// enumerated directory itself gets `level.dir_only` (see `Level`). When
+/// nothing under `root` is denied (the common case), `root` is granted
+/// whole with no extra filesystem work.
+fn grant_paths_excluding(
+    cwd: &Path,
+    root: &Path,
+    deny_paths: &[PathBuf],
+    level: Level,
+    sink: &mut dyn RuleSink,
+) -> Result<(), BuildError> {
     if deny_paths.iter().any(|denied| denied == root) {
-        return;
+        return Ok(());
     }
     if !deny_paths.iter().any(|denied| denied.starts_with(root)) {
-        grants.push_root(root);
-        return;
+        return grant_root_whole(cwd, root, level, sink);
     }
     // Can't enumerate what's inside `root` — fail toward less access, not
     // more, rather than granting a directory whose contents are unknown.
-    let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) else {
-        return;
+    let Some(dir) = open_root(
+        cwd,
+        root,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?
+    else {
+        return Ok(());
     };
-    grant_dir_excluding(root, dir, deny_paths, grants);
+    grant_dir_excluding(root, dir.as_fd(), deny_paths, level, sink)
 }
 
 /// The enumerating half of `grant_paths_excluding`, for a directory
@@ -753,28 +910,38 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf], grants: &mut Grant
 /// inode). Skipping symlinks costs nothing legitimate: Landlock checks the
 /// resolved path, so a symlink whose target is inside some other grant
 /// still works through that grant. An entry that can't be opened or
-/// stat'ed is skipped (fail toward less access).
-fn grant_dir_excluding(path: &Path, dir: OwnedFd, deny_paths: &[PathBuf], grants: &mut Grants) {
+/// stat'ed is skipped (fail toward less access). Each child's rule is
+/// added as soon as it is opened and its fd closed right after, so only
+/// one fd per directory level is held.
+fn grant_dir_excluding(
+    path: &Path,
+    dir: BorrowedFd<'_>,
+    deny_paths: &[PathBuf],
+    level: Level,
+    sink: &mut dyn RuleSink,
+) -> Result<(), BuildError> {
+    sink.add(path, dir, true, level.dir_only)?;
     let relevant: Vec<&PathBuf> = deny_paths
         .iter()
         .filter(|denied| denied.starts_with(path))
         .collect();
-    for (name, _) in dir_entries(dir.as_fd()) {
+    for (name, _) in dir_entries(dir)? {
         let child = path.join(&name);
         if relevant.iter().any(|denied| **denied == child) {
             continue;
         }
         if relevant.iter().any(|denied| denied.starts_with(&child)) {
-            if let Some(subdir) = open_subdir(dir.as_fd(), &name) {
-                grant_dir_excluding(&child, subdir, deny_paths, grants);
+            if let Some(subdir) = open_subdir(dir, &name)? {
+                grant_dir_excluding(&child, subdir.as_fd(), deny_paths, level, sink)?;
             }
             continue;
         }
         let Some(fd) = open_at(
-            dir.as_fd(),
+            dir,
             &name,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        ) else {
+        )?
+        else {
             continue;
         };
         let Some(st) = fd_stat(fd.as_fd()) else {
@@ -784,17 +951,9 @@ fn grant_dir_excluding(path: &Path, dir: OwnedFd, deny_paths: &[PathBuf], grants
         if kind == libc::S_IFLNK {
             continue;
         }
-        grants.full.push(Grant {
-            path: child,
-            fd,
-            is_dir: kind == libc::S_IFDIR,
-        });
+        sink.add(&child, fd.as_fd(), kind == libc::S_IFDIR, level.full)?;
     }
-    grants.dir_only.push(Grant {
-        path: path.to_path_buf(),
-        fd: dir,
-        is_dir: true,
-    });
+    Ok(())
 }
 
 fn canonical_or_given(path: &Path) -> PathBuf {
@@ -819,13 +978,19 @@ fn multiply_linked_inodes(deny_paths: &[PathBuf]) -> std::collections::HashSet<(
 /// on every spawn, but only while some denied file has more than one
 /// link.
 fn find_hardlink_aliases(
+    cwd: &Path,
     root: &Path,
     inodes: &std::collections::HashSet<(u64, u64)>,
     out: &mut Vec<PathBuf>,
-) {
-    if let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) {
-        find_hardlink_aliases_in(root, dir.as_fd(), inodes, out);
+) -> Result<(), FdExhausted> {
+    if let Some(dir) = open_root(
+        cwd,
+        root,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )? {
+        find_hardlink_aliases_in(root, dir.as_fd(), inodes, out)?;
     }
+    Ok(())
 }
 
 fn find_hardlink_aliases_in(
@@ -833,12 +998,12 @@ fn find_hardlink_aliases_in(
     dir: BorrowedFd<'_>,
     inodes: &std::collections::HashSet<(u64, u64)>,
     out: &mut Vec<PathBuf>,
-) {
-    for (name, d_type) in dir_entries(dir) {
+) -> Result<(), FdExhausted> {
+    for (name, d_type) in dir_entries(dir)? {
         if matches!(d_type, libc::DT_DIR | libc::DT_UNKNOWN)
-            && let Some(subdir) = open_subdir(dir, &name)
+            && let Some(subdir) = open_subdir(dir, &name)?
         {
-            find_hardlink_aliases_in(&path.join(&name), subdir.as_fd(), inodes, out);
+            find_hardlink_aliases_in(&path.join(&name), subdir.as_fd(), inodes, out)?;
             continue;
         }
         if !matches!(d_type, libc::DT_REG | libc::DT_UNKNOWN) {
@@ -848,7 +1013,8 @@ fn find_hardlink_aliases_in(
             dir,
             &name,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        ) else {
+        )?
+        else {
             continue;
         };
         if let Some(st) = fd_stat(fd.as_fd())
@@ -859,6 +1025,7 @@ fn find_hardlink_aliases_in(
             out.push(path.join(&name));
         }
     }
+    Ok(())
 }
 
 /// Compiles the bare (single-component) `deny_paths` patterns into one
@@ -930,15 +1097,21 @@ const SCAN_CACHE_SETTLE_SECS: i64 = 2;
 /// Each match also forces `grant_paths_excluding` to enumerate its
 /// containing directory child-by-child, so a project with many matching
 /// files produces a larger Landlock ruleset.
+#[allow(clippy::too_many_arguments)]
 fn walk_for_basename_matches(
+    cwd: &Path,
     root: &Path,
     settle_secs: i64,
     patterns: &globset::GlobSet,
     prev: &mut ScanCache,
     next: &mut ScanCache,
     matches: &mut Vec<PathBuf>,
-) {
-    if let Some(dir) = open_path(root, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) {
+) -> Result<(), FdExhausted> {
+    if let Some(dir) = open_root(
+        cwd,
+        root,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )? {
         walk_dir_for_basename_matches(
             root,
             dir.as_fd(),
@@ -947,8 +1120,9 @@ fn walk_for_basename_matches(
             prev,
             next,
             matches,
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn walk_dir_for_basename_matches(
@@ -959,9 +1133,9 @@ fn walk_dir_for_basename_matches(
     prev: &mut ScanCache,
     next: &mut ScanCache,
     matches: &mut Vec<PathBuf>,
-) {
+) -> Result<(), FdExhausted> {
     let Some(st) = fd_stat(dir) else {
-        return;
+        return Ok(());
     };
     let mtime = (st.st_mtime, st.st_mtime_nsec);
     let ctime = (st.st_ctime, st.st_ctime_nsec);
@@ -983,7 +1157,7 @@ fn walk_dir_for_basename_matches(
                 matches: Vec::new(),
                 subdirs: Vec::new(),
             };
-            for (name, d_type) in dir_entries(dir) {
+            for (name, d_type) in dir_entries(dir)? {
                 if patterns.is_match(Path::new(&name)) {
                     scan.matches.push(path.join(&name));
                     continue; // matched — no need to recurse further into it
@@ -1004,7 +1178,7 @@ fn walk_dir_for_basename_matches(
     // symlinked directory (or one swapped in mid-walk) is never followed —
     // which also keeps a symlink cycle from causing unbounded recursion.
     for name in &scan.subdirs {
-        if let Some(subdir) = open_subdir(dir, name) {
+        if let Some(subdir) = open_subdir(dir, name)? {
             walk_dir_for_basename_matches(
                 &path.join(name),
                 subdir.as_fd(),
@@ -1013,7 +1187,7 @@ fn walk_dir_for_basename_matches(
                 prev,
                 next,
                 matches,
-            );
+            )?;
         }
     }
     let now = std::time::SystemTime::now()
@@ -1022,6 +1196,7 @@ fn walk_dir_for_basename_matches(
     if now - mtime.0.max(ctime.0) >= settle_secs {
         next.insert(path.to_path_buf(), scan);
     }
+    Ok(())
 }
 
 /// `SOCK_TYPE_MASK` from the kernel's `linux/net.h` (not in `libc`).
@@ -1203,19 +1378,18 @@ fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
 
 impl ExecutionConfiner for LandlockConfiner {
     fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
-        let (read_grants, write_grants) = self.compute_grants();
-        self.confine_with_grants(command, &read_grants, &write_grants)
+        let built = self.build_ruleset();
+        self.confine_with_ruleset(command, built)
     }
 }
 
 impl LandlockConfiner {
-    /// `confine` with the grants already computed — split out so tests
-    /// can change the filesystem between computing and applying them.
-    fn confine_with_grants(
+    /// `confine` with the ruleset already built — split out so tests can
+    /// change the filesystem between building and applying it.
+    fn confine_with_ruleset(
         &self,
         mut command: tokio::process::Command,
-        read_grants: &Grants,
-        write_grants: &Grants,
+        built: Result<RulesetCreated, BuildError>,
     ) -> tokio::process::Command {
         let require_enforcement = self.require_enforcement;
         for var in SCRUBBED_ENV_VARS {
@@ -1233,17 +1407,20 @@ impl LandlockConfiner {
             };
         }
 
-        let built = Self::build_ruleset(read_grants, write_grants).map_err(|err| err.to_string());
         #[cfg(test)]
         let built = if self.force_ruleset_failure {
-            Err("forced by test".to_string())
+            Err(BuildError::Forced)
         } else {
             built
         };
         let mut ruleset = match built {
             Ok(ruleset) => Some(ruleset),
             Err(err) => {
-                if require_enforcement {
+                // Descriptor exhaustion always fails closed: the "run
+                // without Landlock" fallback below exists for kernels that
+                // lack Landlock, not for a resource limit a repository's
+                // contents can push the parent into.
+                if require_enforcement || matches!(err, BuildError::Exhausted) {
                     // Fail closed: make the spawn itself fail rather than
                     // running unconfined. This closure runs in the parent
                     // (we haven't forked yet), so a detailed, allocated
@@ -1251,8 +1428,7 @@ impl LandlockConfiner {
                     // constraint only applies inside `pre_exec` below.
                     tracing::warn!(
                         error = %err,
-                        "failed to build Landlock ruleset; refusing to run unconfined \
-                         (sandbox.require_enforcement is true)"
+                        "failed to build Landlock ruleset; refusing to run unconfined"
                     );
                     unsafe {
                         command.pre_exec(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)));
@@ -1353,6 +1529,30 @@ mod tests {
             .unwrap()
     }
 
+    /// A `RuleSink` that records which paths were granted, and how.
+    #[derive(Default)]
+    struct Recorder {
+        full: Vec<PathBuf>,
+        dir_only: Vec<PathBuf>,
+    }
+
+    impl RuleSink for Recorder {
+        fn add(
+            &mut self,
+            path: &Path,
+            _fd: BorrowedFd<'_>,
+            _is_dir: bool,
+            access: landlock::BitFlags<AccessFs>,
+        ) -> Result<(), BuildError> {
+            if access == Level::read().dir_only || access == Level::write().dir_only {
+                self.dir_only.push(path.to_path_buf());
+            } else {
+                self.full.push(path.to_path_buf());
+            }
+            Ok(())
+        }
+    }
+
     fn find_basename_glob_matches(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
         let bare: Vec<&PathBuf> = deny_paths
             .iter()
@@ -1362,12 +1562,14 @@ mod tests {
         if let Some(patterns) = compile_bare_patterns(&bare) {
             walk_for_basename_matches(
                 root,
+                root,
                 SCAN_CACHE_SETTLE_SECS,
                 &patterns,
                 &mut ScanCache::new(),
                 &mut ScanCache::new(),
                 &mut matches,
-            );
+            )
+            .unwrap();
         }
         matches
     }
@@ -1547,8 +1749,73 @@ mod tests {
             return;
         };
         let arg = std::env::var(HELPER_ARG_ENV).unwrap_or_default();
+        if action == "rlimit_confine" {
+            rlimit_confine(&arg);
+            return;
+        }
+        if action == "rlimit_build" {
+            rlimit_build(&arg);
+            return;
+        }
         let (ret, errno) = helper_action(&action, &arg);
         println!("HELPER_RESULT ret={ret} errno={errno}");
+    }
+
+    /// Runs in an *unconfined* re-exec'd helper (so the lowered limit
+    /// can't disturb parallel tests): drops `RLIMIT_NOFILE` to 64, then
+    /// confines commands against `dir`, whose carved tree has far more
+    /// entries than that. Prints one `RLIMIT` line of outcomes.
+    fn rlimit_confine(arg: &str) {
+        let (dir, outside) = arg.split_once('|').unwrap();
+        let (dir, outside) = (Path::new(dir), Path::new(outside));
+        let limit = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        // SAFETY: plain syscall with a valid struct.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = |require: bool, target: &Path| -> &'static str {
+            let confiner = LandlockConfiner::new(dir, &[], &[PathBuf::from("*.pem")], require);
+            let mut command = tokio::process::Command::new("cat");
+            command.arg(target);
+            match runtime.block_on(async { confiner.confine(command).output().await }) {
+                Err(_) => "spawn-failed",
+                Ok(out) if out.status.success() => "read",
+                Ok(_) => "denied",
+            }
+        };
+        let inside = outcome(true, &dir.join("public.txt"));
+        let outside_strict = outcome(true, &outside.join("secret.txt"));
+        let outside_lax = outcome(false, &outside.join("secret.txt"));
+        let denied_lax = outcome(false, &dir.join("nm/d1/a.pem"));
+        println!(
+            "RLIMIT inside={inside} outside_strict={outside_strict} \
+             outside_lax={outside_lax} denied_lax={denied_lax}"
+        );
+    }
+
+    /// Unconfined helper: leaves only a couple of spare descriptors, then
+    /// builds a ruleset for `arg`, whose carved path is deeper than that.
+    /// Prints whether the build reported descriptor exhaustion.
+    fn rlimit_build(arg: &str) {
+        let confiner = LandlockConfiner::new(Path::new(arg), &[], &[PathBuf::from("*.pem")], false);
+        let open_fds = std::fs::read_dir("/proc/self/fd").unwrap().count() as u64;
+        let limit = libc::rlimit {
+            rlim_cur: open_fds + 2,
+            rlim_max: open_fds + 2,
+        };
+        // SAFETY: plain syscall with a valid struct.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let result = match confiner.build_ruleset() {
+            Ok(_) => "built",
+            Err(BuildError::Exhausted) => "exhausted",
+            Err(_) => "other-error",
+        };
+        println!("RLIMIT build={result}");
     }
 
     fn test_exe() -> PathBuf {
@@ -1743,13 +2010,13 @@ mod tests {
 
         // Grants are computed while `docs` is a real directory; a racer
         // then swaps it for a symlink before the ruleset is built.
-        let (read_grants, write_grants) = confiner.compute_grants();
+        let built = confiner.build_ruleset();
         std::fs::rename(dir.path().join("docs"), dir.path().join("docs_real")).unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("docs")).unwrap();
 
         let mut command = tokio::process::Command::new("cat");
         command.arg(dir.path().join("docs/secret.txt"));
-        let command = confiner.confine_with_grants(command, &read_grants, &write_grants);
+        let command = confiner.confine_with_ruleset(command, built);
         let (success, output) = run(command).await;
 
         assert!(!success, "read through the swapped-in symlink must fail");
@@ -2075,6 +2342,104 @@ mod tests {
             success && existed,
             "opted-in shared tmp write failed: {output}"
         );
+    }
+
+    // --- Descriptor use (review 2, N1) -----------------------------------
+
+    #[tokio::test]
+    async fn a_large_carved_tree_works_under_a_low_fd_limit_and_never_fails_open() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE").unwrap();
+        std::fs::write(dir.path().join("public.txt"), "hello").unwrap();
+        // 300 entries under the carved `nm/` against a limit of 64.
+        for i in 0..300 {
+            std::fs::create_dir_all(dir.path().join(format!("nm/d{i}"))).unwrap();
+        }
+        std::fs::write(dir.path().join("nm/d1/a.pem"), "KEY").unwrap();
+
+        let output = tokio::process::Command::new(test_exe())
+            .args([
+                "--exact",
+                "confiner::tests::helper_entry",
+                "--nocapture",
+                "-q",
+            ])
+            .env(HELPER_ENV, "rlimit_confine")
+            .env(
+                HELPER_ARG_ENV,
+                format!("{}|{}", dir.path().display(), outside.path().display()),
+            )
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("RLIMIT "))
+            .unwrap_or_else(|| panic!("no RLIMIT line: {stdout}"));
+
+        assert_eq!(
+            line,
+            "RLIMIT inside=read outside_strict=denied outside_lax=denied denied_lax=denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn descriptor_exhaustion_is_reported_as_such() {
+        let dir = fixture_dir();
+        let deep = dir.path().join("a/b/c/d/e/f/g/h/i/j/k/l");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("x.pem"), "KEY").unwrap();
+
+        let output = tokio::process::Command::new(test_exe())
+            .args([
+                "--exact",
+                "confiner::tests::helper_entry",
+                "--nocapture",
+                "-q",
+            ])
+            .env(HELPER_ENV, "rlimit_build")
+            .env(HELPER_ARG_ENV, dir.path())
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.lines().any(|l| l == "RLIMIT build=exhausted"),
+            "unexpected helper output: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn descriptor_exhaustion_fails_closed_even_when_enforcement_is_optional() {
+        let dir = fixture_dir();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[], false);
+
+        let result = confiner
+            .confine_with_ruleset(
+                tokio::process::Command::new("true"),
+                Err(BuildError::Exhausted),
+            )
+            .status()
+            .await;
+
+        assert!(result.is_err(), "must refuse to spawn without Landlock");
+    }
+
+    #[tokio::test]
+    async fn an_extra_read_path_inside_cwd_replaced_by_a_symlink_grants_nothing() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE").unwrap();
+        // The consumer configured `cwd/data`; a confined command replaced
+        // it with a symlink to somewhere outside.
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("data")).unwrap();
+        let data = dir.path().join("data");
+        let confiner = LandlockConfiner::new(dir.path(), std::slice::from_ref(&data), &[], true);
+
+        assert!(!cat_succeeds(&confiner, &outside.path().join("secret.txt")).await);
     }
 
     // --- Process-group containment (audit I8) ---------------------------
@@ -2470,17 +2835,18 @@ mod tests {
     #[test]
     fn grant_paths_excluding_returns_root_unchanged_when_nothing_is_denied() {
         let dir = fixture_dir();
-        let mut grants = Grants::default();
-        grant_paths_excluding(dir.path(), &[], &mut grants);
-        assert_eq!(grants.full_paths(), vec![dir.path().to_path_buf()]);
+        let mut grants = Recorder::default();
+        grant_paths_excluding(dir.path(), dir.path(), &[], Level::read(), &mut grants).unwrap();
+        assert_eq!(grants.full, vec![dir.path().to_path_buf()]);
         assert!(grants.dir_only.is_empty());
     }
 
     #[test]
     fn grant_paths_excluding_returns_empty_when_root_itself_is_denied() {
         let dir = fixture_dir();
-        let mut grants = Grants::default();
-        grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()], &mut grants);
+        let mut grants = Recorder::default();
+        let deny = [dir.path().to_path_buf()];
+        grant_paths_excluding(dir.path(), dir.path(), &deny, Level::read(), &mut grants).unwrap();
         assert!(grants.full.is_empty() && grants.dir_only.is_empty());
     }
 

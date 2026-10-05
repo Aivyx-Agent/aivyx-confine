@@ -66,20 +66,26 @@ without Landlock):
   classification, which is why these two small functions are `pub` here
   rather than private to `confiner.rs`.
 - `confiner.rs` — `LandlockConfiner`, the real backend, and
-  `kill_process_group`. Grants are computed in `compute_grants` on every
-  `confine()` call: fixed system/toolchain read grants plus `cwd` and
-  `extra_read_paths` (read-only); write grants on `cwd` and a private,
+  `kill_process_group`. The ruleset is rebuilt by `build_ruleset` on
+  every `confine()` call (`resolve_deny_paths`, then `add_grants`): fixed
+  system/toolchain read grants plus `extra_read_paths` (read-only); read
+  and write grants on `cwd` and a private,
   per-confiner `TMPDIR` only; `/dev/{null,zero,urandom,random}`.
   `deny_paths` carve-outs: Landlock has no negative/deny rule, so a denied
   path nested inside a granted root is excluded by enumerating and
   re-granting only its unaffected siblings, never symlinks, while the
   enumerated directory itself keeps list+create rights only — no
   remove/rename, or a denied entry could be renamed out from under its
-  path-based deny (see `Grants`, `grant_paths_excluding`,
+  path-based deny (see `Level`, `grant_paths_excluding`,
   `carved_out_dir_write_access`). Every walk opens children relative to
-  the parent's fd with `O_NOFOLLOW`, and the ruleset is built from those
-  fds (`fd_rules`), never by re-resolving a path — a confined racer can
-  swap entries for symlinks. Bare patterns are found by a walk cached per
+  the parent's fd with `O_NOFOLLOW`, and each rule is added to the
+  ruleset from that fd the moment it is opened, then the fd is closed
+  (`RuleSink`) — never by re-resolving a path, because a confined racer
+  can swap entries for symlinks, and never holding more than one fd per
+  directory level, because a repo's contents must not be able to exhaust
+  `RLIMIT_NOFILE`. `EMFILE`/`ENFILE` (`BuildError::Exhausted`) always
+  fails closed. Roots inside `cwd` (`extra_read_paths` entries) are
+  opened component by component from `cwd`'s fd (`open_root`). Bare patterns are found by a walk cached per
   directory (dev, ino, mtime, ctime); hard-link aliases and home
   credential stores are added to the deny list. Seccomp is three stacked
   filters (`build_seccomp_filters`): the `EPERM` denylist (incl.
