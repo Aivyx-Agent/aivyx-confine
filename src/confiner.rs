@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use landlock::{
     ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
-    path_beneath_rules,
+    Scope, path_beneath_rules,
 };
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -383,6 +383,13 @@ impl LandlockConfiner {
         let (read_grants, write_grants) = self.compute_grants();
         Ruleset::default()
             .handle_access(AccessFs::from_all(LANDLOCK_ABI))?
+            // Signals and abstract Unix sockets may not cross the sandbox
+            // boundary: without this a confined command can kill any of
+            // the user's processes and reach abstract-namespace sockets
+            // (e.g. X11's `@/tmp/.X11-unix/X0`), which no filesystem rule
+            // covers. Needs ABI 6; silently skipped on older kernels
+            // (best-effort compatibility, as for every other right).
+            .scope(Scope::from_all(LANDLOCK_ABI))?
             .create()?
             .add_rules(path_beneath_rules(
                 &read_grants.full,
@@ -1009,6 +1016,11 @@ mod tests {
                         libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
                     (ret as i64, last_errno())
                 }
+                "kill" => {
+                    let pid: libc::pid_t = arg.parse().unwrap();
+                    let ret = libc::kill(pid, libc::SIGTERM);
+                    (ret as i64, last_errno())
+                }
                 "clone_newuser" => {
                     let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
                     let ret = libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize);
@@ -1348,6 +1360,64 @@ mod tests {
         let confiner = LandlockConfiner::new(dir.path(), &[], std::slice::from_ref(&secret), true);
 
         assert!(!cat_succeeds(&confiner, &dir.path().join("sub/alias")).await);
+    }
+
+    // --- Signal and abstract-socket scoping (audit I5) -------------------
+
+    /// Landlock scopes need ABI 6 (Linux 6.12); on older kernels they are
+    /// skipped best-effort, so these tests only assert where they can hold.
+    fn kernel_supports_landlock_scopes() -> bool {
+        detect_landlock_abi() >= 6
+    }
+
+    #[tokio::test]
+    async fn signalling_a_process_outside_the_sandbox_is_blocked() {
+        if !kernel_supports_landlock_scopes() {
+            eprintln!("skipped: Landlock ABI < 6");
+            return;
+        }
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let dir = fixture_dir();
+        let confiner = LandlockConfiner::new(dir.path(), &helper_read_paths(), &[], true);
+
+        let (ret, errno) = run_helper(&confiner, "kill", &victim.id().to_string()).await;
+        let still_running = victim.try_wait().unwrap().is_none();
+        victim.kill().ok();
+        victim.wait().ok();
+
+        assert!(ret < 0, "kill of an outside process must fail");
+        assert_eq!(errno, libc::EPERM);
+        assert!(still_running);
+    }
+
+    #[tokio::test]
+    async fn connecting_to_an_outside_abstract_socket_is_blocked_even_when_opted_out() {
+        use std::os::linux::net::SocketAddrExt;
+        if !kernel_supports_landlock_scopes() {
+            eprintln!("skipped: Landlock ABI < 6");
+            return;
+        }
+        let name = format!(
+            "aivyx-confine-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        );
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        let dir = fixture_dir();
+        let options = crate::ConfineOptions::new()
+            .require_enforcement(true)
+            .allow_unix_sockets(true);
+        let confiner =
+            LandlockConfiner::with_options(dir.path(), &helper_read_paths(), &[], options);
+
+        let (ret, errno) = run_helper(&confiner, "unix_connect", &format!("@{name}")).await;
+
+        assert!(ret < 0, "connect to an outside abstract socket must fail");
+        assert_eq!(errno, libc::EPERM);
     }
 
     // --- Namespace creation and the new mount API (audit I4, M6) --------
