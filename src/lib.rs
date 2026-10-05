@@ -79,6 +79,16 @@ pub struct ConfineOptions {
     /// the sandbox no longer contains code execution in that case.
     /// `socketpair()` keeps working either way.
     pub allow_unix_sockets: bool,
+    /// Opt back into the old temp-dir policy: read+write on the whole
+    /// system temp directory (`/tmp`, and `$TMPDIR` if set). By default a
+    /// confined command instead gets a private temp directory, created
+    /// per confiner under the system temp dir, exported as `TMPDIR`, and
+    /// removed when the confiner is dropped — so it cannot read or modify
+    /// other same-user files in `/tmp` (temp files the unconfined parent
+    /// later consumes, other agents' scratch dirs, `/tmp/.X11-unix`).
+    /// Tools that ignore `TMPDIR` and hard-code `/tmp` fail under the
+    /// default; set this only if a consumer depends on such tools.
+    pub share_system_tmp: bool,
 }
 
 impl ConfineOptions {
@@ -93,6 +103,11 @@ impl ConfineOptions {
 
     pub fn allow_unix_sockets(mut self, value: bool) -> Self {
         self.allow_unix_sockets = value;
+        self
+    }
+
+    pub fn share_system_tmp(mut self, value: bool) -> Self {
+        self.share_system_tmp = value;
         self
     }
 }

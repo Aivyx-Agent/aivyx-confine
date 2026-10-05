@@ -222,6 +222,30 @@ pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &[
     "DISPLAY",
 ];
 
+enum TmpPolicy {
+    Shared,
+    Private(Option<tempfile::TempDir>),
+}
+
+impl TmpPolicy {
+    fn new(share_system_tmp: bool) -> Self {
+        if share_system_tmp {
+            return Self::Shared;
+        }
+        match tempfile::Builder::new().prefix("aivyx-confine-").tempdir() {
+            Ok(dir) => Self::Private(Some(dir)),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not create a private temp directory; confined commands will have \
+                     no writable temp directory"
+                );
+                Self::Private(None)
+            }
+        }
+    }
+}
+
 pub struct LandlockConfiner {
     cwd: PathBuf,
     extra_read_paths: Vec<PathBuf>,
@@ -234,6 +258,10 @@ pub struct LandlockConfiner {
     /// re-read on every spawn. See `walk_for_basename_matches`.
     scan_cache: std::sync::Mutex<ScanCache>,
     home: Option<PathBuf>,
+    /// The temp-dir policy: `None` with `share_system_tmp`, otherwise the
+    /// private directory (itself `None` if it could not be created, in
+    /// which case no temp directory is writable at all).
+    tmp: TmpPolicy,
     /// Installed in order in the child; see `build_seccomp_filters`.
     seccomp_programs: Vec<BpfProgram>,
     require_enforcement: bool,
@@ -290,6 +318,7 @@ impl LandlockConfiner {
             bare_patterns: compile_bare_patterns(&bare),
             scan_cache: std::sync::Mutex::new(ScanCache::new()),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            tmp: TmpPolicy::new(options.share_system_tmp),
             seccomp_programs: build_seccomp_filters(&options),
             require_enforcement,
         }
@@ -377,9 +406,16 @@ impl LandlockConfiner {
             .full
             .extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let mut write_candidates = vec![self.cwd.clone(), std::env::temp_dir()];
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            write_candidates.push(PathBuf::from(tmpdir));
+        let mut write_candidates = vec![self.cwd.clone()];
+        match &self.tmp {
+            TmpPolicy::Shared => {
+                write_candidates.push(std::env::temp_dir());
+                if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+                    write_candidates.push(PathBuf::from(tmpdir));
+                }
+            }
+            TmpPolicy::Private(Some(dir)) => write_candidates.push(dir.path().to_path_buf()),
+            TmpPolicy::Private(None) => {}
         }
         let mut write_grants = Grants::default();
         for root in &write_candidates {
@@ -837,6 +873,12 @@ impl ExecutionConfiner for LandlockConfiner {
         let require_enforcement = self.require_enforcement;
         for var in SCRUBBED_ENV_VARS {
             command.env_remove(var);
+        }
+        if let TmpPolicy::Private(dir) = &self.tmp {
+            match dir {
+                Some(dir) => command.env("TMPDIR", dir.path()),
+                None => command.env_remove("TMPDIR"),
+            };
         }
 
         let ruleset = match self.build_ruleset() {
@@ -1415,6 +1457,78 @@ mod tests {
         }
         assert!(cat_succeeds(&confiner, &cargo.join("bin/tool")).await);
         assert!(cat_succeeds(&confiner, &git.join("config")).await);
+    }
+
+    // --- Private temp directory (audit I7) ------------------------------
+
+    fn unique_system_tmp_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aivyx-confine-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[tokio::test]
+    async fn confined_commands_get_a_private_writable_tmpdir() {
+        let dir = fixture_dir();
+        let confiner = confiner_for(dir.path());
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "echo x > \"$TMPDIR/f\" && cat \"$TMPDIR/f\" && echo \"$TMPDIR\"",
+        ]);
+
+        let (success, output) = run(confiner.confine(command)).await;
+
+        assert!(success, "private TMPDIR not writable: {output}");
+        let tmpdir = PathBuf::from(output.lines().last().unwrap());
+        assert_ne!(tmpdir, std::env::temp_dir());
+        assert!(tmpdir.starts_with(std::env::temp_dir()));
+        drop(confiner);
+        assert!(
+            !tmpdir.exists(),
+            "private TMPDIR must be removed with the confiner"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shared_system_tmp_is_not_writable_by_default() {
+        let dir = fixture_dir();
+        let confiner = confiner_for(dir.path());
+        let target = unique_system_tmp_path();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", &format!("echo x > {}", target.display())]);
+
+        let (success, _) = run(confiner.confine(command)).await;
+        let existed = target.exists();
+        std::fs::remove_file(&target).ok();
+
+        assert!(!success && !existed, "shared /tmp must not be writable");
+    }
+
+    #[tokio::test]
+    async fn share_system_tmp_opts_back_into_the_shared_tmp() {
+        let dir = fixture_dir();
+        let options = crate::ConfineOptions::new()
+            .require_enforcement(true)
+            .share_system_tmp(true);
+        let confiner = LandlockConfiner::with_options(dir.path(), &[], &[], options);
+        let target = unique_system_tmp_path();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", &format!("echo x > {}", target.display())]);
+
+        let (success, output) = run(confiner.confine(command)).await;
+        let existed = target.exists();
+        std::fs::remove_file(&target).ok();
+
+        assert!(
+            success && existed,
+            "opted-in shared tmp write failed: {output}"
+        );
     }
 
     // --- Signal and abstract-socket scoping (audit I5) -------------------
