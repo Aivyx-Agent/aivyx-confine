@@ -63,7 +63,10 @@ const DEVICE_RW_PATHS: &[&str] = &["/dev/null", "/dev/zero", "/dev/urandom", "/d
 /// (like Codex CLI's bubblewrap) would otherwise block for free via
 /// capability dropping. This design doesn't use namespaces, so those need
 /// to be explicit here instead. `unshare`/`setns` are blocked outright since
-/// a coding agent's tools never need to create or join namespaces.
+/// a coding agent's tools never need to create or join namespaces; `clone`
+/// with a namespace flag and `clone3` are handled separately in
+/// `build_seccomp_filters`. The new mount API (`fsopen` .. `mount_setattr`)
+/// is blocked alongside `mount`.
 // `libc::SYS_kexec_file_load` is genuinely absent from this crate's musl
 // bindings for aarch64 and riscv64 (confirmed directly against
 // libc-0.2.189's source: present for musl x86_64/loongarch64/s390x/
@@ -107,6 +110,12 @@ const BLOCKED_SYSCALLS: &[i64] = &[
     libc::SYS_unshare,
     libc::SYS_setns,
     libc::SYS_personality,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
 ];
 
 /// Syscalls with no legitimate use in a coding agent's shell commands,
@@ -117,7 +126,10 @@ const BLOCKED_SYSCALLS: &[i64] = &[
 /// (like Codex CLI's bubblewrap) would otherwise block for free via
 /// capability dropping. This design doesn't use namespaces, so those need
 /// to be explicit here instead. `unshare`/`setns` are blocked outright since
-/// a coding agent's tools never need to create or join namespaces.
+/// a coding agent's tools never need to create or join namespaces; `clone`
+/// with a namespace flag and `clone3` are handled separately in
+/// `build_seccomp_filters`. The new mount API (`fsopen` .. `mount_setattr`)
+/// is blocked alongside `mount`.
 ///
 /// Identical to the list above minus `SYS_kexec_file_load`, which this
 /// crate's musl bindings don't define on aarch64/riscv64 — see that
@@ -153,6 +165,12 @@ const BLOCKED_SYSCALLS: &[i64] = &[
     libc::SYS_unshare,
     libc::SYS_setns,
     libc::SYS_personality,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
 ];
 
 /// Read-only probe of kernel Landlock support, safe to call from the parent
@@ -180,6 +198,11 @@ fn detect_landlock_abi() -> i64 {
 /// dir that holds most of their sockets). Removed from every confined
 /// command — see `ConfineOptions::allow_unix_sockets` for why reaching
 /// those endpoints is an escape, not just an information leak.
+/// `__X32_SYSCALL_BIT`: x86_64 syscall numbers with this bit set select
+/// the x32 ABI, which shares `AUDIT_ARCH_X86_64` with native calls.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
 pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
@@ -201,7 +224,8 @@ pub struct LandlockConfiner {
     /// re-read on every spawn. See `walk_for_basename_matches`.
     scan_cache: std::sync::Mutex<ScanCache>,
     home: Option<PathBuf>,
-    seccomp_program: BpfProgram,
+    /// Installed in order in the child; see `build_seccomp_filters`.
+    seccomp_programs: Vec<BpfProgram>,
     require_enforcement: bool,
 }
 
@@ -256,7 +280,7 @@ impl LandlockConfiner {
             bare_patterns: compile_bare_patterns(&bare),
             scan_cache: std::sync::Mutex::new(ScanCache::new()),
             home: std::env::var_os("HOME").map(PathBuf::from),
-            seccomp_program: build_seccomp_filter(&options),
+            seccomp_programs: build_seccomp_filters(&options),
             require_enforcement,
         }
     }
@@ -642,11 +666,108 @@ fn walk_for_basename_matches(
     }
 }
 
-fn build_seccomp_filter(options: &crate::ConfineOptions) -> BpfProgram {
+/// `clone` flags that create a namespace. `unshare` is blocked outright,
+/// but `clone(CLONE_NEWUSER | SIGCHLD)` reaches the same kernel surface.
+const NAMESPACE_CLONE_FLAGS: &[libc::c_int] = &[
+    libc::CLONE_NEWUSER,
+    libc::CLONE_NEWNS,
+    libc::CLONE_NEWNET,
+    libc::CLONE_NEWPID,
+    libc::CLONE_NEWIPC,
+    libc::CLONE_NEWUTS,
+    libc::CLONE_NEWCGROUP,
+];
+
+/// Index of `clone`'s flags argument: s390x swaps the first two.
+#[cfg(target_arch = "s390x")]
+const CLONE_FLAGS_ARG: u8 = 1;
+#[cfg(not(target_arch = "s390x"))]
+const CLONE_FLAGS_ARG: u8 = 0;
+
+/// The seccomp filters, installed in this order. Each one is a separate
+/// kernel filter; for any syscall the most restrictive verdict wins, and
+/// each filter only ever answers `Allow` or one errno, so they compose
+/// without interfering:
+///
+/// 1. The denylist (`BLOCKED_SYSCALLS`, namespace-creating `clone`,
+///    `socket(AF_UNIX)` unless opted out) → `EPERM`.
+/// 2. `clone3` → `ENOSYS`. Its flags live in a user-memory struct seccomp
+///    cannot inspect, so it can't be filtered like `clone`; `ENOSYS` makes
+///    glibc and others fall back to plain `clone`, which is filtered.
+/// 3. x86_64 only: any syscall number with the x32 bit set → `EPERM`.
+///    seccompiler's arch check accepts x32 numbers (they share
+///    `AUDIT_ARCH_X86_64`), so on a kernel built with x32 support every
+///    denylisted syscall would otherwise be reachable by its x32 number.
+fn build_seccomp_filters(options: &crate::ConfineOptions) -> Vec<BpfProgram> {
+    #[allow(unused_mut)]
+    let mut programs = vec![build_denylist_filter(options), build_clone3_filter()];
+    #[cfg(target_arch = "x86_64")]
+    programs.push(build_x32_filter());
+    programs
+}
+
+fn build_clone3_filter() -> BpfProgram {
+    let rules = std::iter::once((libc::SYS_clone3, vec![])).collect();
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        std::env::consts::ARCH.try_into().expect("known arch"),
+    )
+    .expect("static seccomp policy is well-formed")
+    .try_into()
+    .expect("seccomp policy compiles to BPF")
+}
+
+/// Hand-written because seccompiler only matches individual syscall
+/// numbers, not ranges.
+#[cfg(target_arch = "x86_64")]
+fn build_x32_filter() -> BpfProgram {
+    use seccompiler::sock_filter;
+    const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+    // Offsets into `struct seccomp_data`.
+    const NR_OFFSET: u32 = 0;
+    const ARCH_OFFSET: u32 = 4;
+    const LD_W_ABS: u16 = 0x20; // BPF_LD (0) | BPF_W (0) | BPF_ABS
+    const JEQ_K: u16 = 0x05 | 0x10; // BPF_JMP | BPF_JEQ | BPF_K (0)
+    const JGE_K: u16 = 0x05 | 0x30; // BPF_JMP | BPF_JGE | BPF_K (0)
+    const RET_K: u16 = 0x06; // BPF_RET | BPF_K (0)
+    let ins = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+    vec![
+        // 0: A = arch; 1: not x86_64 → allow (index 5)
+        ins(LD_W_ABS, 0, 0, ARCH_OFFSET),
+        ins(JEQ_K, 0, 3, AUDIT_ARCH_X86_64),
+        // 2: A = nr; 3: nr >= x32 bit → errno (4), else allow (5)
+        ins(LD_W_ABS, 0, 0, NR_OFFSET),
+        ins(JGE_K, 0, 1, X32_SYSCALL_BIT),
+        ins(RET_K, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        ins(RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ]
+}
+
+fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = BLOCKED_SYSCALLS
         .iter()
         .map(|&syscall| (syscall, vec![]))
         .collect();
+    rules.insert(
+        libc::SYS_clone,
+        NAMESPACE_CLONE_FLAGS
+            .iter()
+            .map(|&flag| {
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        CLONE_FLAGS_ARG,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::MaskedEq(flag as u64),
+                        flag as u64,
+                    )
+                    .expect("static seccomp condition is well-formed"),
+                ])
+                .expect("static seccomp rule is well-formed")
+            })
+            .collect(),
+    );
     if !options.allow_unix_sockets {
         // `socket(AF_UNIX, ...)` → EPERM: Landlock does not gate
         // `connect()` to an existing pathname Unix socket, so this is the
@@ -717,8 +838,7 @@ impl ExecutionConfiner for LandlockConfiner {
             }
         };
         let mut ruleset = Some(ruleset);
-        let seccomp_program = self.seccomp_program.clone();
-        let mut seccomp_program = Some(seccomp_program);
+        let mut seccomp_programs = Some(self.seccomp_programs.clone());
 
         // SAFETY: every error path inside this closure uses an
         // `ErrorKind`-based `io::Error` (std's allocation-free "simple"
@@ -753,9 +873,11 @@ impl ExecutionConfiner for LandlockConfiner {
                         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                     }
                 }
-                if let Some(program) = seccomp_program.take() {
-                    seccompiler::apply_filter(&program)
-                        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                if let Some(programs) = seccomp_programs.take() {
+                    for program in &programs {
+                        seccompiler::apply_filter(program)
+                            .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                    }
                 }
                 Ok(())
             });
@@ -886,6 +1008,38 @@ mod tests {
                     let ret =
                         libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
                     (ret as i64, last_errno())
+                }
+                "clone_newuser" => {
+                    let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
+                    let ret = libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize);
+                    if ret == 0 {
+                        libc::_exit(0);
+                    }
+                    let errno = last_errno();
+                    if ret > 0 {
+                        libc::waitpid(ret as libc::pid_t, std::ptr::null_mut(), 0);
+                    }
+                    (ret, errno)
+                }
+                "clone3" => {
+                    // Deliberately invalid args: an unfiltered kernel says
+                    // EINVAL, the filter says ENOSYS before the kernel looks.
+                    let ret = libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize);
+                    (ret, last_errno())
+                }
+                "fsopen" => {
+                    let ret = libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), 0u32);
+                    (ret, last_errno())
+                }
+                "open_tree" => {
+                    let ret =
+                        libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, c"/".as_ptr(), 0u32);
+                    (ret, last_errno())
+                }
+                #[cfg(target_arch = "x86_64")]
+                "x32_getpid" => {
+                    let ret = libc::syscall(X32_SYSCALL_BIT as libc::c_long | libc::SYS_getpid);
+                    (ret, last_errno())
                 }
                 other => panic!("unknown helper action {other}"),
             }
@@ -1194,6 +1348,47 @@ mod tests {
         let confiner = LandlockConfiner::new(dir.path(), &[], std::slice::from_ref(&secret), true);
 
         assert!(!cat_succeeds(&confiner, &dir.path().join("sub/alias")).await);
+    }
+
+    // --- Namespace creation and the new mount API (audit I4, M6) --------
+
+    async fn helper_on_default_confiner(action: &str) -> (i64, i32) {
+        let dir = fixture_dir();
+        let confiner = LandlockConfiner::new(dir.path(), &helper_read_paths(), &[], true);
+        run_helper(&confiner, action, "").await
+    }
+
+    #[tokio::test]
+    async fn clone_with_a_new_user_namespace_is_blocked() {
+        let (ret, errno) = helper_on_default_confiner("clone_newuser").await;
+        assert!(ret < 0, "clone(CLONE_NEWUSER) must fail");
+        assert_eq!(errno, libc::EPERM);
+    }
+
+    #[tokio::test]
+    async fn clone3_reports_enosys_so_libc_falls_back_to_clone() {
+        let (ret, errno) = helper_on_default_confiner("clone3").await;
+        assert!(ret < 0);
+        assert_eq!(errno, libc::ENOSYS);
+    }
+
+    #[tokio::test]
+    async fn the_new_mount_api_is_blocked() {
+        for action in ["fsopen", "open_tree"] {
+            let (ret, errno) = helper_on_default_confiner(action).await;
+            assert!(ret < 0, "{action} must fail");
+            assert_eq!(errno, libc::EPERM, "{action}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn x32_syscall_numbers_are_rejected() {
+        // Without the filter this kernel answers ENOSYS (no x32 support)
+        // or runs getpid (x32 support) — either way, not EPERM.
+        let (ret, errno) = helper_on_default_confiner("x32_getpid").await;
+        assert!(ret < 0);
+        assert_eq!(errno, libc::EPERM);
     }
 
     #[tokio::test]
