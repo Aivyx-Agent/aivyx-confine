@@ -291,7 +291,9 @@ pub struct LandlockConfiner {
     /// The previous bare-pattern walk, so unchanged directories are not
     /// re-read on every spawn. See `walk_for_basename_matches`.
     scan_cache: std::sync::Mutex<ScanCache>,
-    home: Option<PathBuf>,
+    /// The `$HOME`-relative grants and carve-outs, resolved at
+    /// construction. See `HomePaths`.
+    home: Option<HomePaths>,
     /// `SCAN_CACHE_SETTLE_SECS`, as a field so tests can exercise the
     /// cache without waiting.
     scan_settle_secs: i64,
@@ -357,7 +359,7 @@ impl LandlockConfiner {
             deny_paths: non_bare.into_iter().cloned().collect(),
             bare_patterns: compile_bare_patterns(&bare),
             scan_cache: std::sync::Mutex::new(ScanCache::new()),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home: std::env::var_os("HOME").map(|home| HomePaths::new(Path::new(&home))),
             scan_settle_secs: SCAN_CACHE_SETTLE_SECS,
             tmp: TmpPolicy::new(options.share_system_tmp),
             seccomp_programs: build_seccomp_filters(&options),
@@ -425,10 +427,10 @@ impl LandlockConfiner {
         // the next spawn's computation picks it up.
         if let Some(home) = &self.home {
             resolved_deny_paths.extend(
-                HOME_CREDENTIAL_PATHS
+                home.credentials
                     .iter()
-                    .map(|p| home.join(p))
-                    .filter(|p| p.symlink_metadata().is_ok()),
+                    .filter(|p| p.symlink_metadata().is_ok())
+                    .cloned(),
             );
         }
         if let Some(patterns) = &self.bare_patterns {
@@ -482,7 +484,7 @@ impl LandlockConfiner {
     ) -> Result<(), BuildError> {
         let mut read_roots: Vec<PathBuf> = DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
         if let Some(home) = &self.home {
-            read_roots.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
+            read_roots.extend(home.roots.iter().cloned());
         }
         read_roots.extend(extra_read_paths.iter().cloned());
         for root in &read_roots {
@@ -719,12 +721,17 @@ fn lexically_inside<'a>(
     (plain && !rest.as_os_str().is_empty()).then_some(rest)
 }
 
-/// Opens a grant root. A root inside `cwd` (whose entries a confined
-/// command controls) is opened from `cwd`'s fd one component at a time
-/// with `O_NOFOLLOW`, so a symlink planted anywhere along it — including
-/// as the root itself — makes the open fail instead of being followed.
-/// Any other root is a fixed system, home or temp path, or `cwd` itself,
-/// none of which a confined command can replace, and is opened by path.
+/// Opens a grant root. Every root reaching here is already in its final
+/// form: the system paths are fixed, the home toolchain roots were
+/// canonicalised once at construction (`HomePaths`), `cwd` and the temp
+/// dirs are canonical, and `extra_read_paths` entries inside `cwd` are
+/// kept lexical on purpose (`resolve_deny_paths`). A root that lies
+/// inside `cwd` — whose entries a confined command controls — is opened
+/// from `cwd`'s fd one component at a time with `O_NOFOLLOW`, so a
+/// symlink planted anywhere along it, including as the root itself, makes
+/// the open fail (the root is not granted) instead of being followed. Any
+/// other root is outside every write grant, so no confined command can
+/// replace it, and is opened by path.
 fn open_root(cwd: &Path, root: &Path, flags: libc::c_int) -> Opened {
     let Some(rest) = lexically_inside(root, cwd, cwd) else {
         return open_path(root, flags);
@@ -756,6 +763,41 @@ fn open_root(cwd: &Path, root: &Path, flags: libc::c_int) -> Opened {
         dir = next;
     }
     Ok(None)
+}
+
+/// The `$HOME`-relative paths, resolved once when the confiner is built —
+/// trusted time, before any confined command has run. Each toolchain root
+/// (`~/.cargo`, ...) is stored canonicalised, so a dotfile symlinked
+/// elsewhere (`~/.cargo -> /data/cargo`) is granted at its real location
+/// even when `cwd` is `$HOME`; at spawn time it is opened like any other
+/// root (`open_root`), so if the target is inside `cwd`, a symlink planted
+/// there later is still refused rather than followed. The credential
+/// carve-outs are kept in both the given and the canonical-parent form so
+/// they match the grant either way.
+struct HomePaths {
+    roots: Vec<PathBuf>,
+    credentials: Vec<PathBuf>,
+}
+
+impl HomePaths {
+    fn new(home: &Path) -> Self {
+        let roots = DEFAULT_HOME_READ_PATHS
+            .iter()
+            .map(|p| canonical_or_given(&home.join(p)))
+            .collect();
+        let mut credentials = Vec::new();
+        for relative in HOME_CREDENTIAL_PATHS {
+            let given = home.join(relative);
+            if let (Some(parent), Some(name)) = (given.parent(), given.file_name()) {
+                let canonical = canonical_or_given(parent).join(name);
+                if canonical != given {
+                    credentials.push(canonical);
+                }
+            }
+            credentials.push(given);
+        }
+        Self { roots, credentials }
+    }
 }
 
 fn fd_stat(fd: BorrowedFd<'_>) -> Option<libc::stat> {
@@ -1553,6 +1595,13 @@ mod tests {
         }
     }
 
+    impl LandlockConfiner {
+        /// Tests: behave as if `$HOME` were `home` at construction.
+        fn set_home(&mut self, home: &Path) {
+            self.home = Some(HomePaths::new(home));
+        }
+    }
+
     fn find_basename_glob_matches(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
         let bare: Vec<&PathBuf> = deny_paths
             .iter()
@@ -2255,7 +2304,7 @@ mod tests {
         std::fs::write(git.join("config"), "[user]").unwrap();
         let dir = fixture_dir();
         let mut confiner = confiner_for(dir.path());
-        confiner.home = Some(home.path().to_path_buf());
+        confiner.set_home(home.path());
 
         for secret in [
             cargo.join("credentials.toml"),
@@ -2619,6 +2668,23 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "spawn must fail closed");
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_home_toolchain_root_stays_granted_when_cwd_is_home() {
+        let home = fixture_dir();
+        let real = fixture_dir();
+        std::fs::create_dir_all(real.path().join("bin")).unwrap();
+        std::fs::write(real.path().join("bin/tool"), "fine").unwrap();
+        std::fs::write(real.path().join("credentials.toml"), "token").unwrap();
+        // `~/.cargo -> /data/cargo`-style setup, with the agent run in $HOME.
+        std::os::unix::fs::symlink(real.path(), home.path().join(".cargo")).unwrap();
+        let mut confiner = confiner_for(home.path());
+        confiner.set_home(home.path());
+
+        assert!(cat_succeeds(&confiner, &home.path().join(".cargo/bin/tool")).await);
+        assert!(!cat_succeeds(&confiner, &home.path().join(".cargo/credentials.toml")).await);
+        assert!(!cat_succeeds(&confiner, &real.path().join("credentials.toml")).await);
     }
 
     // --- Signal and abstract-socket scoping (audit I5) -------------------
