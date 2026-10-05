@@ -290,6 +290,9 @@ pub struct LandlockConfiner {
     /// Installed in order in the child; see `build_seccomp_filters`.
     seccomp_programs: Vec<BpfProgram>,
     require_enforcement: bool,
+    /// Test hook: behave as if the Landlock ruleset could not be built.
+    #[cfg(test)]
+    force_ruleset_failure: bool,
 }
 
 impl LandlockConfiner {
@@ -346,6 +349,8 @@ impl LandlockConfiner {
             tmp: TmpPolicy::new(options.share_system_tmp),
             seccomp_programs: build_seccomp_filters(&options),
             require_enforcement,
+            #[cfg(test)]
+            force_ruleset_failure: false,
         }
     }
 
@@ -911,8 +916,15 @@ impl ExecutionConfiner for LandlockConfiner {
             };
         }
 
-        let ruleset = match self.build_ruleset() {
-            Ok(ruleset) => ruleset,
+        let built = self.build_ruleset().map_err(|err| err.to_string());
+        #[cfg(test)]
+        let built = if self.force_ruleset_failure {
+            Err("forced by test".to_string())
+        } else {
+            built
+        };
+        let mut ruleset = match built {
+            Ok(ruleset) => Some(ruleset),
             Err(err) => {
                 if require_enforcement {
                     // Fail closed: make the spawn itself fail rather than
@@ -928,17 +940,19 @@ impl ExecutionConfiner for LandlockConfiner {
                     unsafe {
                         command.pre_exec(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)));
                     }
-                } else {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to build Landlock ruleset; running unconfined \
-                         (sandbox.require_enforcement is false)"
-                    );
+                    return command;
                 }
-                return command;
+                // Optional enforcement: run without Landlock, but still
+                // under the seccomp filters below — they don't depend on
+                // the ruleset and lose nothing by being applied alone.
+                tracing::warn!(
+                    error = %err,
+                    "failed to build Landlock ruleset; running without filesystem confinement \
+                     (sandbox.require_enforcement is false), seccomp filters still apply"
+                );
+                None
             }
         };
-        let mut ruleset = Some(ruleset);
         let mut seccomp_programs = Some(self.seccomp_programs.clone());
 
         // SAFETY: every error path inside this closure uses an
@@ -1617,6 +1631,34 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(gone, "background sleep survived kill_process_group");
+    }
+
+    // --- Seccomp without Landlock (audit M2) ----------------------------
+
+    #[tokio::test]
+    async fn seccomp_still_applies_when_landlock_cannot_be_built_and_is_optional() {
+        let dir = fixture_dir();
+        let mut confiner = LandlockConfiner::new(dir.path(), &helper_read_paths(), &[], false);
+        confiner.force_ruleset_failure = true;
+
+        let (ret, errno) = run_helper(&confiner, "unix_socket", "").await;
+
+        assert!(ret < 0, "seccomp must still block AF_UNIX");
+        assert_eq!(errno, libc::EPERM);
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_failure_refuses_to_spawn_when_enforcement_is_required() {
+        let dir = fixture_dir();
+        let mut confiner = confiner_for(dir.path());
+        confiner.force_ruleset_failure = true;
+
+        let result = confiner
+            .confine(tokio::process::Command::new("true"))
+            .status()
+            .await;
+
+        assert!(result.is_err(), "spawn must fail closed");
     }
 
     // --- Signal and abstract-socket scoping (audit I5) -------------------
