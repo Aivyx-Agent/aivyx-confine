@@ -75,7 +75,9 @@ denied file that appears later is still denied.
   write `Cargo.lock` or populate `target/`. The next spawn covers the new
   entries, so a retry works. `rm`/`mv` of entries directly in such a
   directory always fail; deeper, fully granted subdirectories are
-  unaffected.
+  unaffected. That includes litter the agent made itself: after
+  `ln .env y` in the root, `y` is denied (a hard-link alias) and can never
+  be deleted from inside the sandbox.
 - **Kernel ABI.** On kernels whose Landlock ABI is older than V7
   (`PartiallyEnforced`), the rights and scopes they lack are not enforced,
   even with `require_enforcement`: below ABI 6 there are no signal or
@@ -113,11 +115,14 @@ unchanged; everything below is behaviour a consumer will notice.
   that hard-code `/tmp` fail. Opt out with `share_system_tmp`.
 - **Process groups.** Confined commands lead their own process group, no
   longer receive terminal signals (Ctrl-C) aimed at the caller's group,
-  and cannot `setsid`/`setpgid` (Python `start_new_session=True`, the
-  `setsid` tool, interactive job control) unless
-  `allow_leaving_process_group` is set. Git's background auto-maintenance
-  (`gc --auto` detaching after a commit) prints `fatal: setsid failed` and
-  skips that run; the command that triggered it still succeeds. Callers should call
+  and cannot `setsid`/`setpgid` unless `allow_leaving_process_group` is
+  set. That breaks Python `start_new_session=True`, the `setsid` tool,
+  interactive job control, and test runners or supervisors that put their
+  own children into process groups (per-test process groups, likely
+  including cargo-nextest; `posix_spawn` with `POSIX_SPAWN_SETPGROUP`).
+  Git's background auto-maintenance (`gc --auto` detaching after a commit)
+  prints `fatal: setsid failed` and skips that run; the command that
+  triggered it still succeeds. Callers should call
   `kill_process_group(pgid)` when a tool call ends, times out or is
   cancelled; neither consumer does yet.
 - **Signals.** Confined commands cannot signal the caller or processes
@@ -132,7 +137,13 @@ unchanged; everything below is behaviour a consumer will notice.
 - **Credential stores.** `~/.cargo/credentials(.toml)` and
   `~/.config/git/credentials` are unreadable even with no `deny_paths`.
 - **Cost.** `confine()` now does filesystem work on every call when
-  bare-pattern denies are configured.
+  bare-pattern denies are configured. It holds at most one descriptor
+  per directory level while doing so, and if the process is out of
+  descriptors anyway (`EMFILE`/`ENFILE`) the spawn is refused, even with
+  `require_enforcement` off.
+- **`extra_read_paths` inside `cwd`.** Opened without following
+  symlinks: if one is (or is replaced by) a symlink, nothing is granted
+  for it.
 - **New API.** `ConfineOptions` (fails closed by default:
   `require_enforcement` is `true`), `LandlockConfiner::with_options`,
   `default_confiner_with_options`, `kill_process_group`.
