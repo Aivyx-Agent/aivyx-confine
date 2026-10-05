@@ -359,7 +359,7 @@ impl LandlockConfiner {
             deny_paths: non_bare.into_iter().cloned().collect(),
             bare_patterns: compile_bare_patterns(&bare),
             scan_cache: std::sync::Mutex::new(ScanCache::new()),
-            home: std::env::var_os("HOME").map(|home| HomePaths::new(Path::new(&home))),
+            home: std::env::var_os("HOME").map(|home| HomePaths::new(Path::new(&home), cwd)),
             scan_settle_secs: SCAN_CACHE_SETTLE_SECS,
             tmp: TmpPolicy::new(options.share_system_tmp),
             seccomp_programs: build_seccomp_filters(&options),
@@ -723,7 +723,8 @@ fn lexically_inside<'a>(
 
 /// Opens a grant root. Every root reaching here is already in its final
 /// form: the system paths are fixed, the home toolchain roots were
-/// canonicalised once at construction (`HomePaths`), `cwd` and the temp
+/// canonicalised once at construction when outside `cwd` and kept lexical
+/// inside it (`HomePaths`), `cwd` and the temp
 /// dirs are canonical, and `extra_read_paths` entries inside `cwd` are
 /// kept lexical on purpose (`resolve_deny_paths`). A root that lies
 /// inside `cwd` — whose entries a confined command controls — is opened
@@ -765,33 +766,49 @@ fn open_root(cwd: &Path, root: &Path, flags: libc::c_int) -> Opened {
     Ok(None)
 }
 
-/// The `$HOME`-relative paths, resolved once when the confiner is built —
-/// trusted time, before any confined command has run. Each toolchain root
-/// (`~/.cargo`, ...) is stored canonicalised, so a dotfile symlinked
-/// elsewhere (`~/.cargo -> /data/cargo`) is granted at its real location
-/// even when `cwd` is `$HOME`; at spawn time it is opened like any other
-/// root (`open_root`), so if the target is inside `cwd`, a symlink planted
-/// there later is still refused rather than followed. The credential
-/// carve-outs are kept in both the given and the canonical-parent form so
-/// they match the grant either way.
+/// The `$HOME`-relative paths, resolved once when the confiner is built.
+///
+/// A toolchain root (`~/.cargo`, ...) *outside* `cwd` can't be touched by
+/// a confined command, so it is stored canonicalised: a dotfile symlinked
+/// elsewhere (`~/.cargo -> /data/cargo`) is granted at its real location.
+/// A root *inside* `cwd` (the agent runs in `$HOME` or an ancestor) is
+/// attacker-writable — an earlier confined command can plant
+/// `~/.cargo -> /` — so it is kept lexical, and `open_root` opens it with
+/// the `O_NOFOLLOW` component walk: a symlinked toolchain dir inside `cwd`
+/// is simply not granted (a documented limit). `$HOME` itself is only
+/// canonicalised when it is outside `cwd`, for the same reason. The
+/// credential carve-outs follow the same rule and are kept in both forms
+/// when canonicalised, so they match the grant either way.
 struct HomePaths {
     roots: Vec<PathBuf>,
     credentials: Vec<PathBuf>,
 }
 
 impl HomePaths {
-    fn new(home: &Path) -> Self {
+    fn new(home: &Path, cwd: &Path) -> Self {
+        let canonical_cwd = canonical_or_given(cwd);
+        // `Some(path re-anchored on the canonical cwd)` when `path` is
+        // `cwd` or lexically inside it.
+        let in_cwd = |path: &Path| -> Option<PathBuf> {
+            if path == cwd || path == canonical_cwd {
+                return Some(canonical_cwd.clone());
+            }
+            lexically_inside(path, cwd, &canonical_cwd).map(|rest| canonical_cwd.join(rest))
+        };
+        let base = in_cwd(home).unwrap_or_else(|| canonical_or_given(home));
+        let resolve = |path: PathBuf| in_cwd(&path).unwrap_or_else(|| canonical_or_given(&path));
+
         let roots = DEFAULT_HOME_READ_PATHS
             .iter()
-            .map(|p| canonical_or_given(&home.join(p)))
+            .map(|p| resolve(base.join(p)))
             .collect();
         let mut credentials = Vec::new();
         for relative in HOME_CREDENTIAL_PATHS {
-            let given = home.join(relative);
+            let given = base.join(relative);
             if let (Some(parent), Some(name)) = (given.parent(), given.file_name()) {
-                let canonical = canonical_or_given(parent).join(name);
-                if canonical != given {
-                    credentials.push(canonical);
+                let resolved = resolve(parent.to_path_buf()).join(name);
+                if resolved != given {
+                    credentials.push(resolved);
                 }
             }
             credentials.push(given);
@@ -923,7 +940,10 @@ fn grant_paths_excluding(
     level: Level,
     sink: &mut dyn RuleSink,
 ) -> Result<(), BuildError> {
-    if deny_paths.iter().any(|denied| denied == root) {
+    // A root that *is* a denied path, or lies anywhere inside one, is
+    // never granted — not only an exact match: an `extra_read_paths`
+    // entry or a home toolchain root can point into a denied directory.
+    if deny_paths.iter().any(|denied| root.starts_with(denied)) {
         return Ok(());
     }
     if !deny_paths.iter().any(|denied| denied.starts_with(root)) {
@@ -1608,7 +1628,7 @@ mod tests {
     impl LandlockConfiner {
         /// Tests: behave as if `$HOME` were `home` at construction.
         fn set_home(&mut self, home: &Path) {
-            self.home = Some(HomePaths::new(home));
+            self.home = Some(HomePaths::new(home, &self.cwd));
         }
     }
 
@@ -2705,20 +2725,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_symlinked_home_toolchain_root_stays_granted_when_cwd_is_home() {
+    async fn a_symlinked_home_toolchain_root_is_granted_only_when_outside_cwd() {
         let home = fixture_dir();
         let real = fixture_dir();
         std::fs::create_dir_all(real.path().join("bin")).unwrap();
         std::fs::write(real.path().join("bin/tool"), "fine").unwrap();
         std::fs::write(real.path().join("credentials.toml"), "token").unwrap();
-        // `~/.cargo -> /data/cargo`-style setup, with the agent run in $HOME.
+        // `~/.cargo -> /data/cargo`-style setup.
         std::os::unix::fs::symlink(real.path(), home.path().join(".cargo")).unwrap();
-        let mut confiner = confiner_for(home.path());
-        confiner.set_home(home.path());
+        let project = fixture_dir();
 
+        // Agent run elsewhere: the dotfile is trusted and granted at its
+        // real location, credentials still carved out.
+        let mut confiner = confiner_for(project.path());
+        confiner.set_home(home.path());
         assert!(cat_succeeds(&confiner, &home.path().join(".cargo/bin/tool")).await);
         assert!(!cat_succeeds(&confiner, &home.path().join(".cargo/credentials.toml")).await);
         assert!(!cat_succeeds(&confiner, &real.path().join("credentials.toml")).await);
+
+        // Agent run in $HOME: the symlink is attacker-writable, so it is
+        // not followed and its target is not granted (documented limit).
+        let mut confiner = confiner_for(home.path());
+        confiner.set_home(home.path());
+        assert!(!cat_succeeds(&confiner, &home.path().join(".cargo/bin/tool")).await);
+    }
+
+    /// Plants `$HOME/.cargo -> target` through a confined command (cwd and
+    /// `$HOME` are the same directory), then builds a *second* confiner,
+    /// as consumers do per call, session or specialist.
+    async fn plant_cargo_then_rebuild(
+        home: &Path,
+        target: &Path,
+        deny: &[PathBuf],
+    ) -> LandlockConfiner {
+        let mut first = LandlockConfiner::new(home, &[], deny, true);
+        first.set_home(home);
+        let mut command = tokio::process::Command::new("ln");
+        command
+            .current_dir(home)
+            .arg("-s")
+            .arg(target)
+            .arg(".cargo");
+        let (success, output) = run(first.confine(command)).await;
+        assert!(success, "planting failed: {output}");
+        let mut second = LandlockConfiner::new(home, &[], deny, true);
+        second.set_home(home);
+        second
+    }
+
+    #[tokio::test]
+    async fn a_toolchain_symlink_planted_in_home_grants_nothing_to_a_later_confiner() {
+        let home = fixture_dir();
+        let outside = fixture_dir();
+        std::fs::write(outside.path().join("s.txt"), "OUTSIDE-SECRET").unwrap();
+
+        let second = plant_cargo_then_rebuild(home.path(), Path::new("/"), &[]).await;
+
+        assert!(!cat_succeeds(&second, &outside.path().join("s.txt")).await);
+        assert!(
+            !cat_succeeds(
+                &second,
+                &home
+                    .path()
+                    .join(".cargo")
+                    .join(outside.path().strip_prefix("/").unwrap())
+                    .join("s.txt")
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_toolchain_symlink_into_a_denied_directory_grants_nothing() {
+        let home = fixture_dir();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("keys")).unwrap();
+        std::fs::write(ssh.join("keys/id"), "SSHKEY").unwrap();
+        let deny = [ssh.clone()];
+
+        let second = plant_cargo_then_rebuild(home.path(), &ssh.join("keys"), &deny).await;
+
+        assert!(!cat_succeeds(&second, &ssh.join("keys/id")).await);
+        assert!(!cat_succeeds(&second, &home.path().join(".cargo/id")).await);
+    }
+
+    #[tokio::test]
+    async fn an_extra_read_path_inside_a_denied_directory_grants_nothing() {
+        let dir = fixture_dir();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(secrets.join("sub")).unwrap();
+        std::fs::write(secrets.join("sub/key"), "KEY").unwrap();
+        let confiner = LandlockConfiner::new(
+            dir.path(),
+            &[secrets.join("sub")],
+            std::slice::from_ref(&secrets),
+            true,
+        );
+
+        assert!(!cat_succeeds(&confiner, &secrets.join("sub/key")).await);
     }
 
     // --- Signal and abstract-socket scoping (audit I5) -------------------

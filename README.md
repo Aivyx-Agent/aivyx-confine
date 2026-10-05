@@ -89,10 +89,16 @@ denied file that appears later is still denied.
   ran out of descriptors, and `EPERM` when applying the ruleset or a
   seccomp filter fails in the child. The parent also logs the cause at
   warn level.
-- **Symlinked home toolchain dirs** (`~/.cargo -> /data/cargo`) are
-  resolved once, when the confiner is built, and granted at their real
-  location. Re-pointing such a symlink later takes effect only for a new
-  confiner.
+- **Symlinked home toolchain dirs** (`~/.cargo -> /data/cargo`). When
+  `$HOME` is outside `cwd`, they are resolved when the confiner is built
+  and granted at their real location (re-pointing one later takes effect
+  only for a new confiner). When `cwd` is `$HOME` or an ancestor of it,
+  they are not followed at all — an earlier confined command could have
+  planted `~/.cargo -> /` — so a symlinked toolchain dir is not granted;
+  tools needing it fail with `EACCES`. Real (non-symlink) toolchain dirs
+  are unaffected.
+- **Grant roots inside a denied path** (an `extra_read_paths` entry, or a
+  toolchain dir, under a `deny_paths` directory) are never granted.
 - **Kernel ABI.** On kernels whose Landlock ABI is older than V7
   (`PartiallyEnforced`), the rights and scopes they lack are not enforced,
   even with `require_enforcement`: below ABI 6 there are no signal or

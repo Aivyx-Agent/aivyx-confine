@@ -84,8 +84,12 @@ without Landlock):
   can swap entries for symlinks, and never holding more than one fd per
   directory level, because a repo's contents must not be able to exhaust
   `RLIMIT_NOFILE`. `EMFILE`/`ENFILE` (`BuildError::Exhausted`) always
-  fails closed. Roots inside `cwd` (`extra_read_paths` entries) are
-  opened component by component from `cwd`'s fd (`open_root`). Bare patterns are found by a walk cached per
+  fails closed. Roots inside `cwd` (`extra_read_paths` entries, and
+  home toolchain dirs when `cwd ⊇ $HOME`) are kept lexical and opened
+  component by component from `cwd`'s fd (`open_root`); home toolchain
+  dirs outside `cwd` are canonicalised once at construction
+  (`HomePaths`). A root equal to or inside a denied path is never
+  granted. Bare patterns are found by a walk cached per
   directory (dev, ino, mtime, ctime); hard-link aliases and home
   credential stores are added to the deny list. Seccomp is three stacked
   filters (`build_seccomp_filters`): the `EPERM` denylist (incl.
