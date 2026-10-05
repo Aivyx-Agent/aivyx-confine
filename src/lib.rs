@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "sandbox-backend")]
 mod confiner;
 #[cfg(feature = "sandbox-backend")]
-pub use confiner::LandlockConfiner;
+pub use confiner::{LandlockConfiner, kill_process_group};
 
 /// Wraps/restricts an about-to-spawn process before it execs.
 /// `NoopConfiner` is the identity fallback (for platforms/kernels without
@@ -17,6 +17,19 @@ pub use confiner::LandlockConfiner;
 /// default) is the real Landlock + seccomp-bpf backend. Swapping between
 /// them never touches any tool implementation — consumers depend on this
 /// trait, not on which backend is active.
+///
+/// Process-group contract: `LandlockConfiner` puts every confined command
+/// in a new process group it leads (`process_group(0)`), so terminal
+/// signals aimed at the caller's group no longer reach it and the caller
+/// is responsible for its lifetime. To make sure nothing it started keeps
+/// running after the tool call (a background `cmd &`, a daemonised
+/// grandchild), record `Child::id()` right after `spawn()` and call
+/// `kill_process_group` with it when the call finishes, times out or is
+/// cancelled — `kill_on_drop` alone kills only the direct child. A
+/// process that calls `setsid`/`setpgid` itself leaves the group and is
+/// not reached; containing those needs a cgroup, which this crate does
+/// not manage. `NoopConfiner` changes nothing, so never call
+/// `kill_process_group` for a command it "confined".
 pub trait ExecutionConfiner: Send + Sync {
     fn confine(&self, command: tokio::process::Command) -> tokio::process::Command;
 }

@@ -25,4 +25,4 @@ sandbox-backend = ["dep:landlock", "dep:libc", "dep:seccompiler", "dep:tempfile"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "io-util", "time"] }

@@ -246,6 +246,31 @@ impl TmpPolicy {
     }
 }
 
+/// Sends `SIGKILL` to the process group `pgid` — every process a
+/// confined command left behind, as long as none of them called
+/// `setsid`/`setpgid` to leave the group (see the process-group contract
+/// on `ExecutionConfiner`). `LandlockConfiner`
+/// makes each confined command the leader of a new group, so `pgid` is
+/// the `Child::id()` recorded right after `spawn()` — record it then,
+/// since `id()` returns `None` once the child has been reaped. A group
+/// that no longer exists is not an error. `pgid` 0 (which would mean
+/// "the caller's own group") and values beyond `pid_t` are rejected.
+pub fn kill_process_group(pgid: u32) -> io::Result<()> {
+    let pgid = libc::pid_t::try_from(pgid)
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: plain syscall with a validated, positive group id.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
 pub struct LandlockConfiner {
     cwd: PathBuf,
     extra_read_paths: Vec<PathBuf>,
@@ -874,6 +899,11 @@ impl ExecutionConfiner for LandlockConfiner {
         for var in SCRUBBED_ENV_VARS {
             command.env_remove(var);
         }
+        // Its own process group, so the caller can kill everything the
+        // command leaves running (`kill_process_group`) — a lingering
+        // confined process could otherwise rewrite files the caller's
+        // next unconfined step reads.
+        command.process_group(0);
         if let TmpPolicy::Private(dir) = &self.tmp {
             match dir {
                 Some(dir) => command.env("TMPDIR", dir.path()),
@@ -1529,6 +1559,64 @@ mod tests {
             success && existed,
             "opted-in shared tmp write failed: {output}"
         );
+    }
+
+    // --- Process-group containment (audit I8) ---------------------------
+
+    #[tokio::test]
+    async fn a_confined_command_leads_its_own_process_group() {
+        let dir = fixture_dir();
+        let confiner = confiner_for(dir.path());
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("5").kill_on_drop(true);
+        let child = confiner.confine(command).spawn().unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+
+        // SAFETY: plain query syscall.
+        let pgid = unsafe { libc::getpgid(pid) };
+
+        assert_eq!(pgid, pid);
+    }
+
+    #[test]
+    fn kill_process_group_rejects_the_callers_own_group() {
+        assert_eq!(
+            crate::kill_process_group(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_process_group_reaches_background_descendants() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = fixture_dir();
+        let confiner = confiner_for(dir.path());
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = confiner.confine(command).spawn().unwrap();
+        let pgid = child.id().unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let background: libc::pid_t = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+
+        crate::kill_process_group(pgid).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("the group leader survived kill_process_group")
+            .unwrap();
+
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: signal 0 only probes for existence.
+            if unsafe { libc::kill(background, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gone, "background sleep survived kill_process_group");
     }
 
     // --- Signal and abstract-socket scoping (audit I5) -------------------
