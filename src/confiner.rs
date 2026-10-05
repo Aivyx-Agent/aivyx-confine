@@ -356,6 +356,18 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
         if relevant.iter().any(|denied| **denied == child) {
             continue;
         }
+        // Never grant a symlink entry. `path_beneath_rules` opens each
+        // grant following symlinks and Landlock attaches the rule to the
+        // *target* inode, so granting `docs -> /` here would hand out
+        // read+write on the whole filesystem. Skipping costs nothing
+        // legitimate: Landlock checks the resolved path, so a symlink
+        // whose target is inside some other grant still works through
+        // that grant. An entry whose type can't be read is skipped too
+        // (fail toward less access).
+        match entry.file_type() {
+            Ok(file_type) if !file_type.is_symlink() => {}
+            _ => continue,
+        }
         if relevant.iter().any(|denied| denied.starts_with(&child)) {
             grants.extend(grant_paths_excluding(&child, deny_paths));
         } else {
@@ -778,6 +790,57 @@ mod tests {
 
         assert!(success, "command failed: {output}");
         assert_eq!(output.trim(), "[]");
+    }
+
+    // --- Symlinks in an enumerated (carved-out) directory (audit C2) -----
+
+    #[tokio::test]
+    async fn a_symlink_next_to_a_denied_file_does_not_grant_its_target() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("docs")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join("docs/secret.txt"));
+        let (success, output) = run(confiner.confine(command)).await;
+        assert!(!success, "read through the symlink must fail: {output}");
+        assert!(!output.contains("top secret"));
+
+        let written = outside.path().join("w.txt");
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("echo pwn > {}", dir.path().join("docs/w.txt").display()),
+        ]);
+        let (success, _) = run(confiner.confine(command)).await;
+        assert!(!success, "write through the symlink must fail");
+        assert!(!written.exists());
+    }
+
+    #[tokio::test]
+    async fn a_symlink_to_root_in_a_carved_out_subdirectory_grants_nothing() {
+        let dir = fixture_dir();
+        let outside = fixture_dir();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+        let certs = dir.path().join("certs");
+        std::fs::create_dir(&certs).unwrap();
+        std::fs::write(certs.join("test.pem"), "KEY").unwrap();
+        std::os::unix::fs::symlink("/", certs.join("root")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from("*.pem")], true);
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(
+            certs
+                .join("root")
+                .join(outside.path().strip_prefix("/").unwrap())
+                .join("secret.txt"),
+        );
+        let (success, output) = run(confiner.confine(command)).await;
+        assert!(!success, "read through certs/root must fail: {output}");
+        assert!(!output.contains("top secret"));
     }
 
     #[tokio::test]
