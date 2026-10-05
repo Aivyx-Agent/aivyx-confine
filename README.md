@@ -78,6 +78,21 @@ denied file that appears later is still denied.
   unaffected. That includes litter the agent made itself: after
   `ln .env y` in the root, `y` is denied (a hard-link alias) and can never
   be deleted from inside the sandbox.
+- **Descriptors and depth.** Building the ruleset holds one descriptor
+  per directory level it descends into. A repository with a denied file
+  nested about a thousand directories deep can therefore exhaust a 1024
+  soft `RLIMIT_NOFILE`, and every confined spawn in it is refused with
+  `EMFILE`. This fails closed, so only the repository's own author is
+  affected; raising the limit fixes it.
+- **Refused spawns.** `spawn()` fails with `EACCES` when Landlock can't
+  be applied under `require_enforcement`, `EMFILE` when the ruleset build
+  ran out of descriptors, and `EPERM` when applying the ruleset or a
+  seccomp filter fails in the child. The parent also logs the cause at
+  warn level.
+- **Symlinked home toolchain dirs** (`~/.cargo -> /data/cargo`) are
+  resolved once, when the confiner is built, and granted at their real
+  location. Re-pointing such a symlink later takes effect only for a new
+  confiner.
 - **Kernel ABI.** On kernels whose Landlock ABI is older than V7
   (`PartiallyEnforced`), the rights and scopes they lack are not enforced,
   even with `require_enforcement`: below ABI 6 there are no signal or
