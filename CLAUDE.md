@@ -91,7 +91,18 @@ without Landlock):
   (`HomePaths`). A root equal to or inside a denied path is never
   granted. Bare patterns are found by a walk cached per
   directory (dev, ino, mtime, ctime); hard-link aliases and home
-  credential stores are added to the deny list. Seccomp is three stacked
+  credential stores are added to the deny list. When `cwd` covers
+  `$HOME` (`HomePaths::covered`), `$HOME` is cut out of the write grant
+  and granted by `grant_covered_home` instead: `ReadDir` only on `$HOME`
+  itself (no create/remove/rename — a missing rc file is a persistence
+  target), dot entries, `~/bin` and dotfile targets/hard-link aliases
+  found at construction (`scan_dot_entries`) read-only, other entries
+  writable. A carved directory above a `locked` directory (a covered
+  `$HOME`, a home secret store, a dotfile target; `add_grants`) gets
+  `ReadDir` only: Landlock rights are inherited, so its create rights
+  would reach into it. Other denied directories are deliberately not
+  locked, so a project with a denied dir keeps creating entries at its
+  root. Seccomp is three stacked
   filters (`build_seccomp_filters`): the `EPERM` denylist (incl.
   namespace `clone` flags, the new mount API and, by default,
   `setsid`/`setpgid`, `socket(AF_UNIX)` and AF_UNIX datagram
