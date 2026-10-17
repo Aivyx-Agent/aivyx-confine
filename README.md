@@ -32,23 +32,32 @@ denied file that appears later is still denied.
   basename globs (`.env`, `*.pem`, matched anywhere under `cwd` and
   `extra_read_paths`) are carved out of every grant. Roots and entries are
   compared in canonical form. Hard-link aliases of a denied file under
-  those roots are denied too. `~/.cargo/credentials(.toml)`,
+  those roots are denied too. A carved directory with a denied
+  *directory* anywhere below it gets list rights only (no create):
+  Landlock rights are inherited, so create rights there would let `ln -s`
+  or `mkdir` plant entries inside the denied directory. `~/.cargo/credentials(.toml)`,
   `~/.config/git/credentials` and `~/.git-credentials` are always denied,
   and so is every other home secret store a covered `$HOME` would expose
   (next item). A directory that had to
   be carved keeps only list and create rights, so `ls`, `touch` and
   `mkdir` work in it, but `rm` and `mv` of its direct entries do not (see
   the limits below).
-- **`cwd` covering `$HOME`** (`cwd` is `$HOME`, an ancestor of it, or
-  the real directory behind a symlinked `$HOME`): the write grant on
-  `cwd` stops at `$HOME`, which gets its own, narrower rules, because
-  everything a login, shell or desktop session runs by itself lives
-  there:
+- **`cwd` covering `$HOME`** (`cwd` is `$HOME`, an ancestor of it such as
+  `/`, or the real directory behind a symlinked `$HOME`; `$HOME` falls
+  back to the passwd entry when unset or relative, and a root `$HOME` is
+  never covered): the write grant on `cwd` stops at `$HOME`, which gets
+  its own, narrower rules, because what a login, shell or desktop session
+  runs by itself is configured there:
   - `$HOME` itself: list only. Nothing can be created, removed, renamed
     or linked directly in it, since a *missing* `~/.bash_profile` or
     `~/.zshenv` is as good a persistence target as an existing one.
   - Every dot entry (`.bashrc`, `.profile`, `.config/**`, `.local/**`,
-    ...) and `~/bin`: read-only.
+    ...) and `~/bin`: read-only. So are the targets of symlinked dot
+    entries inside `cwd` (stow-style `~/.zshrc -> dotfiles/zshrc`) and
+    hard-link aliases of dot files under `$HOME`'s visible entries (found
+    down to `~/.a/b/c`, `.cache` skipped, when the confiner is built).
+  - Every directory between `cwd` and `$HOME` (`/`, `/home`): list only,
+    as for any carved directory above a denied one.
   - Every other entry (`Documents`, `Projects`, ...): read and write as
     before.
   - Secret stores: no access at all — `.ssh`, `.gnupg`, `.aws`, `.azure`,
@@ -57,8 +66,9 @@ denied file that appears later is still denied.
     Firefox, Thunderbird, Chrome, Chromium and Brave profiles, Signal
     Desktop and `signal-cli` data, `.netrc`, `.pgpass`, `.npmrc`,
     `.pypirc`, `.gem/credentials`, `.vault-token` and Terraform's
-    credentials file. A consumer's own secrets (its config, tokens,
-    stores) still need its `deny_paths`.
+    credentials file, at their real location too when symlinked. A
+    consumer's own secrets (its config, tokens, stores) still need its
+    `deny_paths`.
 - **Seccomp:** a denylist (`ptrace`, `io_uring_*`, `mount` and the new
   mount API, `bpf`, `unshare`, `setns`, `clone` with any `CLONE_NEW*` flag,
   `perf_event_open`, the keyring, ...) returns `EPERM`. `clone3` returns
@@ -89,11 +99,18 @@ denied file that appears later is still denied.
 ### Known limits
 
 - **A covered `$HOME` (above) is not a project directory.** The agent
-  cannot create, delete or rename entries directly in `~`, nor change
-  any dot entry (no `cargo install`, `pip install --user` or shell
-  config edits), and the secret-store list is a list: a secret kept
-  under some other visible name stays readable. Run the agent in a
-  project directory where possible.
+  cannot create, delete or rename entries directly in `~` (or in `/`,
+  `/home` when `cwd` is above `$HOME`), nor change any dot entry (no
+  `cargo install`, `pip install --user` or shell config edits; a
+  dotfiles repo checked out at `~/.git` is read-only). The secret-store
+  list is a list: a secret kept under some other visible name stays
+  readable. Visible directories are still writable, and some code there
+  runs later by itself: git hooks of other repos under `~/Projects`,
+  `.envrc` files with direnv, `~/go/bin` and similar on `PATH`. Symlinked
+  or hard-linked dotfiles deeper than the scan, or changed after the
+  confiner was built, are not covered. A `TMPDIR` inside a covered
+  `$HOME`'s dot entries (`~/.cache/tmp`) is not writable. Run the agent
+  in a project directory where possible.
 
 - The network is not restricted.
 - **Carved-out directories (I1).** A directory that holds a denied entry
@@ -152,10 +169,13 @@ denied file that appears later is still denied.
 
 ## Upgrading from `671e0bd`
 
-Only confiners whose `cwd` covers `$HOME` change (see "`cwd` covering
+Mostly confiners whose `cwd` covers `$HOME` change (see "`cwd` covering
 `$HOME`" above). For them, a command that creates, removes or renames an
-entry directly in `~`, or writes any dot entry or `~/bin`, now fails
-with `EACCES`, and the listed secret stores are unreadable. The secret
+entry directly in `~` (or in a directory between `cwd` and `~`), or
+writes any dot entry, a dotfile's target or `~/bin`, now fails with
+`EACCES`, and the listed secret stores are unreadable. For every `cwd`,
+a carved directory above a denied directory no longer allows creating
+entries in it. The secret
 stores are also carved out of any `extra_read_paths` entry that reaches
 them, for every `cwd`; an entry (or a `cwd`) *inside* one is no longer
 granted.

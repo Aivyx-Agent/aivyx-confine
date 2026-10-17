@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use landlock::{
@@ -396,7 +397,7 @@ impl LandlockConfiner {
             deny_paths: non_bare.into_iter().cloned().collect(),
             bare_patterns: compile_bare_patterns(&bare),
             scan_cache: std::sync::Mutex::new(ScanCache::new()),
-            home: std::env::var_os("HOME").map(|home| HomePaths::new(Path::new(&home), cwd)),
+            home: user_home().map(|home| HomePaths::new(&home, cwd)),
             scan_settle_secs: SCAN_CACHE_SETTLE_SECS,
             tmp: TmpPolicy::new(options.share_system_tmp),
             seccomp_programs: build_seccomp_filters(&options),
@@ -541,14 +542,25 @@ impl LandlockConfiner {
         }
         // When `cwd` covers `$HOME`, `$HOME` is cut out of the write grants
         // like a denied path and granted on its own terms instead.
+        // Dotfile targets outside the dot entries (`HomePaths::read_only`)
+        // are cut out the same way and granted read-only.
         let covered_home = self.home.as_ref().and_then(|home| home.covered.as_ref());
-        let mut write_excluded = deny_paths.to_vec();
+        let read_only: &[PathBuf] = match (&self.home, covered_home) {
+            (Some(home), Some(_)) => &home.read_only,
+            _ => &[],
+        };
+        let mut home_excluded = deny_paths.to_vec();
+        home_excluded.extend(read_only.iter().cloned());
+        let mut write_excluded = home_excluded.clone();
         write_excluded.extend(covered_home.cloned());
         for root in &write_roots {
             grant_paths_excluding(cwd, root, &write_excluded, Level::write(), sink)?;
         }
         if let Some(home) = covered_home {
-            grant_covered_home(cwd, home, deny_paths, sink)?;
+            grant_covered_home(cwd, home, &home_excluded, sink)?;
+        }
+        for root in read_only {
+            grant_paths_excluding(cwd, root, deny_paths, Level::read(), sink)?;
         }
         // Individual device files, not subject to deny_paths carve-outs
         // (they're fixed, well-known, and content-free); missing ones are
@@ -811,6 +823,41 @@ fn open_root(cwd: &Path, root: &Path, flags: libc::c_int) -> Opened {
     Ok(None)
 }
 
+/// The user's home directory: `$HOME` when it is absolute, otherwise the
+/// passwd entry's. A daemon or container started without `HOME` (or with
+/// a relative one) would otherwise get none of the home carve-outs.
+fn user_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && home.is_absolute()
+    {
+        return Some(home);
+    }
+    passwd_home()
+}
+
+fn passwd_home() -> Option<PathBuf> {
+    // SAFETY: `passwd` is plain old data; `getpwuid_r` fills it and points
+    // its strings into `buf`, which outlives every use below.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; 16 * 1024];
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        );
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        let path = PathBuf::from(OsStr::from_bytes(dir));
+        path.is_absolute().then_some(path)
+    }
+}
+
 /// The `$HOME`-relative paths, resolved once when the confiner is built.
 ///
 /// A toolchain root (`~/.cargo`, ...) *outside* `cwd` can't be touched by
@@ -831,6 +878,12 @@ struct HomePaths {
     /// or an ancestor of it. The write grant on `cwd` then stops at
     /// `$HOME`, which is granted by `grant_covered_home` instead.
     covered: Option<PathBuf>,
+    /// With `covered`: places inside `cwd` but outside `$HOME`'s dot
+    /// entries that a dot entry reaches anyway — the targets of symlinked
+    /// dot entries (stow-style `~/.zshrc -> dotfiles/zshrc`) and hard-link
+    /// aliases of dot files. They are cut out of the write grants and
+    /// granted read-only. See `scan_dot_entries`.
+    read_only: Vec<PathBuf>,
 }
 
 impl HomePaths {
@@ -848,7 +901,11 @@ impl HomePaths {
         // `/data/u`) is covered too. Resolving it is safe: when `cwd`
         // covers the real directory, its parent is a carved directory
         // without rename/remove rights, so it can't be swapped later.
-        let covered = in_cwd(home).or_else(|| in_cwd(&canonical_or_given(home)));
+        // A root `$HOME` (`HOME=/`, some service accounts) is never
+        // "covered": its rules would then apply to the whole filesystem.
+        let covered = in_cwd(home)
+            .or_else(|| in_cwd(&canonical_or_given(home)))
+            .filter(|home| home.parent().is_some());
         let base = covered.clone().unwrap_or_else(|| canonical_or_given(home));
         let resolve = |path: PathBuf| in_cwd(&path).unwrap_or_else(|| canonical_or_given(&path));
 
@@ -865,14 +922,100 @@ impl HomePaths {
                     credentials.push(resolved);
                 }
             }
+            // A covered `$HOME`'s dot entries can't be changed from inside
+            // the sandbox, so a secret store symlinked elsewhere
+            // (`~/.ssh -> Sync/ssh`) is safely denied at its real location.
+            if covered.is_some() && given.symlink_metadata().is_ok() {
+                let real = canonical_or_given(&given);
+                if real != given {
+                    credentials.push(real);
+                }
+            }
             credentials.push(given);
         }
+        let read_only = match &covered {
+            Some(home) => scan_dot_entries(&canonical_cwd, home),
+            None => Vec::new(),
+        };
         Self {
             roots,
             credentials,
             covered,
+            read_only,
         }
     }
+}
+
+/// How deep `scan_dot_entries` looks into `$HOME`'s dot entries
+/// (`~/.a/b/c` is depth 3), and how many entries it reads at most.
+const DOT_SCAN_DEPTH: usize = 3;
+const DOT_SCAN_MAX_ENTRIES: usize = 20_000;
+
+/// Finds what a covered `$HOME`'s dot entries reach outside themselves
+/// (`HomePaths::read_only`): the canonical target of every symlink among
+/// them down to `DOT_SCAN_DEPTH` (skipping `.cache`), when the target is
+/// inside `cwd` and isn't `$HOME` or an ancestor of it, and every
+/// hard-link alias, under `$HOME`'s visible entries, of a dot file with
+/// more than one link. Runs once, when the confiner is built: nothing
+/// under a covered `$HOME`'s dot entries can be changed from inside the
+/// sandbox, and a target's carved parent loses rename/remove rights, so
+/// the result stays true for this confiner's spawns.
+fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut linked: std::collections::HashSet<(u64, u64)> = Default::default();
+    let mut budget = DOT_SCAN_MAX_ENTRIES;
+    let mut pending: Vec<(PathBuf, usize)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.as_bytes().starts_with(b".") && name != ".cache" {
+            pending.push((entry.path(), 1));
+        }
+    }
+    while let Some((path, depth)) = pending.pop() {
+        if budget == 0 {
+            tracing::warn!(
+                home = %home.display(),
+                "stopped scanning $HOME's dot entries after {DOT_SCAN_MAX_ENTRIES} entries; \
+                 symlinked or hard-linked dotfiles beyond them stay writable at their target"
+            );
+            break;
+        }
+        budget -= 1;
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = path.canonicalize()
+                && target.starts_with(cwd)
+                && !home.starts_with(&target)
+            {
+                found.push(target);
+            }
+        } else if meta.is_file() && meta.nlink() > 1 {
+            linked.insert((meta.dev(), meta.ino()));
+        } else if meta.is_dir()
+            && depth < DOT_SCAN_DEPTH
+            && let Ok(entries) = std::fs::read_dir(&path)
+        {
+            pending.extend(entries.flatten().map(|e| (e.path(), depth + 1)));
+        }
+    }
+    if !linked.is_empty()
+        && let Ok(entries) = std::fs::read_dir(home)
+    {
+        for entry in entries.flatten() {
+            let visible = !entry.file_name().as_bytes().starts_with(b".");
+            if visible && entry.file_type().is_ok_and(|t| !t.is_symlink()) {
+                // Out of descriptors: keep what was found; the rest of the
+                // aliases stay writable, as with an unscanned depth.
+                let _ = find_hardlink_aliases(cwd, &entry.path(), &linked, &mut found);
+            }
+        }
+    }
+    found
 }
 
 /// The write grant for a `$HOME` that `cwd` covers. Everything a login,
@@ -1088,7 +1231,22 @@ fn grant_dir_excluding(
     level: Level,
     sink: &mut dyn RuleSink,
 ) -> Result<(), BuildError> {
-    sink.add(path, dir, true, level.dir_only)?;
+    // Landlock rights are inherited by everything beneath a rule's inode,
+    // so `level.dir_only`'s create rights here would also apply inside an
+    // excluded *directory* below (a denied dir, or a covered `$HOME`):
+    // `ln -s` or `mkdir` could plant entries in it. Such a directory gets
+    // list rights only.
+    let below_is_excluded_dir = deny_paths.iter().any(|denied| {
+        denied.as_path() != path
+            && denied.starts_with(path)
+            && denied.symlink_metadata().is_ok_and(|m| m.is_dir())
+    });
+    let dir_access = if below_is_excluded_dir {
+        AccessFs::ReadDir.into()
+    } else {
+        level.dir_only
+    };
+    sink.add(path, dir, true, dir_access)?;
     grant_children_excluding(path, dir, deny_paths, &|_| level, sink)
 }
 
@@ -2714,6 +2872,209 @@ mod tests {
         assert!(!sh_succeeds(&confiner, home.path(), ": >> .bashrc").await);
         assert!(!sh_succeeds(&confiner, home.path(), ": > .zshenv").await);
         assert!(sh_succeeds(&confiner, home.path(), "echo x >> notes.txt").await);
+    }
+
+    /// Review C1: Landlock rights are inherited, so create rights on a
+    /// carved ancestor of `$HOME` would reach into `$HOME` and its dot
+    /// directories. Checks that nothing appears, with `symlink_metadata`
+    /// (a refused write can still leave an empty file behind).
+    async fn assert_nothing_planted_in_home(cwd: &Path, h: &Path) {
+        std::fs::create_dir_all(h.join("docs")).unwrap();
+        std::fs::write(h.join("docs/evil.sh"), "#!/bin/sh").unwrap();
+        let plants = [
+            (
+                format!("ln -s docs/evil.sh '{}/.zshenv'", h.display()),
+                ".zshenv",
+            ),
+            (
+                format!(
+                    "ln -s ../../docs/evil.sh '{}/.config/autostart/x.desktop'",
+                    h.display()
+                ),
+                ".config/autostart/x.desktop",
+            ),
+            (
+                format!(
+                    "ln -s ../docs/evil.sh '{}/.ssh/authorized_keys'",
+                    h.display()
+                ),
+                ".ssh/authorized_keys",
+            ),
+            (format!("mkfifo '{}/.fifo'", h.display()), ".fifo"),
+            (format!(": > '{}/.zprofile'", h.display()), ".zprofile"),
+            (
+                format!("mkdir '{}/.config/new'", h.display()),
+                ".config/new",
+            ),
+        ];
+        let confiner = confiner_at_home(cwd, h);
+        for (script, planted) in &plants {
+            sh_succeeds(&confiner, h, script).await;
+            assert!(
+                h.join(planted).symlink_metadata().is_err(),
+                "`{script}` planted {planted}"
+            );
+        }
+        let scripts: Vec<&str> = plants.iter().map(|(s, _)| s.as_str()).collect();
+        // The control runs in fresh fake homes, so re-point the scripts.
+        for script in scripts {
+            let control = fake_home();
+            std::fs::create_dir_all(control.path().join("docs")).unwrap();
+            std::fs::write(control.path().join("docs/evil.sh"), "").unwrap();
+            let script = script.replace(
+                &h.display().to_string(),
+                &control.path().display().to_string(),
+            );
+            let mut command = tokio::process::Command::new("sh");
+            command.current_dir(control.path()).arg("-c").arg(&script);
+            assert!(run(command).await.0, "control: `{script}` fails unconfined");
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_can_be_planted_in_home_from_a_cwd_above_it() {
+        let parent = fixture_dir();
+        let h = parent.path().join("user");
+        std::fs::rename(fake_home().keep(), &h).unwrap();
+        assert_nothing_planted_in_home(parent.path(), &h).await;
+    }
+
+    #[tokio::test]
+    async fn nothing_can_be_planted_in_home_from_the_root_directory() {
+        let home = fake_home();
+        assert_nothing_planted_in_home(Path::new("/"), home.path()).await;
+    }
+
+    #[tokio::test]
+    async fn nothing_can_be_planted_in_home_from_home_itself() {
+        let home = fake_home();
+        assert_nothing_planted_in_home(home.path(), home.path()).await;
+    }
+
+    /// Review M4: the same inheritance plants into a denied directory.
+    #[tokio::test]
+    async fn nothing_can_be_planted_in_a_denied_directory() {
+        let dir = fixture_dir();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[dir.path().join("secrets")], true);
+
+        sh_succeeds(&confiner, dir.path(), "ln -s /x secrets/planted").await;
+        sh_succeeds(&confiner, dir.path(), "mkdir secrets/sub").await;
+        assert!(
+            dir.path()
+                .join("secrets/planted")
+                .symlink_metadata()
+                .is_err()
+        );
+        assert!(dir.path().join("secrets/sub").symlink_metadata().is_err());
+    }
+
+    /// Review I1: stow-style dotfiles live in a visible directory.
+    #[tokio::test]
+    async fn at_home_root_symlinked_dotfiles_stay_read_only() {
+        let home = fake_home();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("dotfiles/nvim")).unwrap();
+        std::fs::write(h.join("dotfiles/zshrc"), "# z").unwrap();
+        std::fs::write(h.join("dotfiles/nvim/init.lua"), "-- n").unwrap();
+        std::fs::write(h.join("dotfiles/README"), "r").unwrap();
+        std::os::unix::fs::symlink("dotfiles/zshrc", h.join(".zshrc")).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/nvim", h.join(".config/nvim")).unwrap();
+        let scripts = [
+            "echo evil >> .zshrc",
+            "echo evil >> dotfiles/zshrc",
+            "echo evil >> dotfiles/nvim/init.lua",
+            ": > dotfiles/nvim/evil.lua",
+        ];
+        let confiner = confiner_at_home(h, h);
+
+        assert!(cat_succeeds(&confiner, &h.join(".zshrc")).await);
+        for script in scripts {
+            assert!(
+                !sh_succeeds(&confiner, h, script).await,
+                "`{script}` succeeded"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(h.join("dotfiles/zshrc")).unwrap(),
+            "# z"
+        );
+        assert!(h.join("dotfiles/nvim/evil.lua").symlink_metadata().is_err());
+        // The rest of the dotfiles repo stays writable.
+        assert!(sh_succeeds(&confiner, h, "echo more >> dotfiles/README").await);
+        // Control: the same writes work unconfined.
+        for script in scripts {
+            let mut command = tokio::process::Command::new("sh");
+            command.current_dir(h).arg("-c").arg(script);
+            assert!(run(command).await.0, "control: `{script}` fails unconfined");
+        }
+    }
+
+    /// Review I1: a hard link shares the dot file's inode.
+    #[tokio::test]
+    async fn at_home_root_a_hard_link_to_a_dotfile_is_read_only() {
+        let home = fake_home();
+        let h = home.path();
+        std::fs::write(h.join(".profile"), "# p").unwrap();
+        std::fs::hard_link(h.join(".profile"), h.join("Projects/profile-copy")).unwrap();
+        let confiner = confiner_at_home(h, h);
+
+        assert!(!sh_succeeds(&confiner, h, "echo evil >> Projects/profile-copy").await);
+        assert_eq!(std::fs::read_to_string(h.join(".profile")).unwrap(), "# p");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .current_dir(h)
+            .arg("-c")
+            .arg("echo ok >> Projects/profile-copy");
+        assert!(run(command).await.0, "control fails unconfined");
+    }
+
+    /// Review I2: a secret store symlinked into a visible directory.
+    #[tokio::test]
+    async fn at_home_root_a_symlinked_secret_store_is_still_denied() {
+        let home = fixture_dir();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("Sync/ssh2")).unwrap();
+        std::fs::write(h.join("Sync/ssh2/id_rsa"), "FAKE-SSH-KEY").unwrap();
+        std::fs::create_dir_all(h.join("Sync/gh")).unwrap();
+        std::fs::write(h.join("Sync/gh/hosts.yml"), "FAKE-GH").unwrap();
+        std::fs::create_dir(h.join(".config")).unwrap();
+        std::os::unix::fs::symlink("Sync/ssh2", h.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink("../Sync/gh", h.join(".config/gh")).unwrap();
+        let confiner = confiner_at_home(h, h);
+
+        for secret in [
+            "Sync/ssh2/id_rsa",
+            ".ssh/id_rsa",
+            "Sync/gh/hosts.yml",
+            ".config/gh/hosts.yml",
+        ] {
+            assert!(
+                !cat_succeeds(&confiner, &h.join(secret)).await,
+                "{secret} readable"
+            );
+        }
+        let (readable, _) = run({
+            let mut command = tokio::process::Command::new("cat");
+            command.arg(h.join(".ssh/id_rsa"));
+            command
+        })
+        .await;
+        assert!(readable, "control: unreadable even unconfined");
+    }
+
+    #[test]
+    fn a_root_home_is_never_covered() {
+        assert!(
+            HomePaths::new(Path::new("/"), Path::new("/"))
+                .covered
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_passwd_home_is_an_absolute_path() {
+        assert!(passwd_home().is_some_and(|home| home.is_absolute()));
     }
 
     #[tokio::test]
