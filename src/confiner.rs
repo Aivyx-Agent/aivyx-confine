@@ -989,6 +989,9 @@ const DOT_SCAN_FIRST: &[&str] = &[
     ".local/bin",
     ".local/share/applications",
     ".local/share/systemd",
+    ".config/fish",
+    ".config/zsh",
+    ".config/bash",
 ];
 
 /// Bulky dot trees that hold caches, downloads and toolchains rather than

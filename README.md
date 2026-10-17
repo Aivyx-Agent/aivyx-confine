@@ -66,7 +66,8 @@ denied file that appears later is still denied.
     `~/.config/nvim -> ~/Projects/dot/nvim`, nothing new can be created
     directly in `~/Projects` or `~/Projects/dot` (existing entries stay
     writable); a dotfile target *file*'s directory only loses rename and
-    remove.
+    remove. A dot entry linked to a whole visible folder
+    (`~/.projects -> Projects`) makes that folder read-only.
   - Every other entry (`Documents`, `Projects`, ...): read and write as
     before.
   - Secret stores: no access at all — `.ssh`, `.gnupg`, `.aws`, `.azure`,
@@ -119,7 +120,9 @@ denied file that appears later is still denied.
   or hard-linked dotfiles deeper than the scan, beyond its entry budget
   (20,000 dot entries, 100,000 for the alias search), or linked after the
   confiner was built (a long-lived confiner keeps its first result) are
-  not covered; nor is an alias hidden by renaming a directory while the
+  not covered, and when a dot directory is itself a link
+  (`~/.config -> dotfiles/config`) the cache skip list doesn't apply
+  inside it; nor is an alias hidden by renaming a directory while the
   confiner is being built (only aliases the user made are at stake). A `TMPDIR` inside a covered
   `$HOME`'s dot entries (`~/.cache/tmp`) is not writable. Run the agent
   in a project directory where possible.
