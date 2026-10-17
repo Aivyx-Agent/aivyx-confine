@@ -526,7 +526,7 @@ impl LandlockConfiner {
         }
         read_roots.extend(extra_read_paths.iter().cloned());
         for root in &read_roots {
-            grant_paths_excluding(cwd, root, deny_paths, Level::read(), sink)?;
+            grant_paths_excluding(cwd, root, deny_paths, &[], Level::read(), sink)?;
         }
 
         let mut write_roots = vec![cwd.to_path_buf()];
@@ -553,14 +553,22 @@ impl LandlockConfiner {
         home_excluded.extend(read_only.iter().cloned());
         let mut write_excluded = home_excluded.clone();
         write_excluded.extend(covered_home.cloned());
+        // What nothing may be planted into (see `grant_dir_excluding`):
+        // only with a covered `$HOME`, so a project `cwd` is unaffected.
+        let mut locked: Vec<PathBuf> = Vec::new();
+        if let (Some(home), Some(covered)) = (&self.home, covered_home) {
+            locked.push(covered.clone());
+            locked.extend(home.credentials.iter().cloned());
+            locked.extend(home.read_only.iter().cloned());
+        }
         for root in &write_roots {
-            grant_paths_excluding(cwd, root, &write_excluded, Level::write(), sink)?;
+            grant_paths_excluding(cwd, root, &write_excluded, &locked, Level::write(), sink)?;
         }
         if let Some(home) = covered_home {
-            grant_covered_home(cwd, home, &home_excluded, sink)?;
+            grant_covered_home(cwd, home, &home_excluded, &locked, sink)?;
         }
         for root in read_only {
-            grant_paths_excluding(cwd, root, deny_paths, Level::read(), sink)?;
+            grant_paths_excluding(cwd, root, deny_paths, &[], Level::read(), sink)?;
         }
         // Individual device files, not subject to deny_paths carve-outs
         // (they're fixed, well-known, and content-free); missing ones are
@@ -947,19 +955,24 @@ impl HomePaths {
 }
 
 /// How deep `scan_dot_entries` looks into `$HOME`'s dot entries
-/// (`~/.a/b/c` is depth 3), and how many entries it reads at most.
-const DOT_SCAN_DEPTH: usize = 3;
+/// (`~/.a/b/c` is depth 3; `~/.config/systemd/user/x.target.wants/y` is
+/// 5), and how many entries it reads at most there and in the visible
+/// trees searched for hard-link aliases.
+const DOT_SCAN_DEPTH: usize = 6;
 const DOT_SCAN_MAX_ENTRIES: usize = 20_000;
+const ALIAS_SCAN_MAX_ENTRIES: usize = 100_000;
 
 /// Finds what a covered `$HOME`'s dot entries reach outside themselves
-/// (`HomePaths::read_only`): the canonical target of every symlink among
-/// them down to `DOT_SCAN_DEPTH` (skipping `.cache`), when the target is
-/// inside `cwd` and isn't `$HOME` or an ancestor of it, and every
-/// hard-link alias, under `$HOME`'s visible entries, of a dot file with
-/// more than one link. Runs once, when the confiner is built: nothing
-/// under a covered `$HOME`'s dot entries can be changed from inside the
-/// sandbox, and a target's carved parent loses rename/remove rights, so
-/// the result stays true for this confiner's spawns.
+/// (`HomePaths::read_only`), for every symlink among them down to
+/// `DOT_SCAN_DEPTH` (`.cache` skipped): each symlink passed on the way to
+/// the final target, and the target itself (`symlink_chain`), when inside
+/// `cwd` and not `$HOME` or an ancestor of it. Plus every hard-link alias,
+/// under `$HOME`'s visible entries, of a dot file with more than one link.
+/// Runs once, when the confiner is built: nothing under a covered
+/// `$HOME`'s dot entries can be changed from inside the sandbox, and each
+/// result's carved parents lose rename/remove rights, so the result stays
+/// true for this confiner's spawns. The walks are path-based; anything
+/// they get wrong only adds read-only carve-outs, never a grant.
 fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut linked: std::collections::HashSet<(u64, u64)> = Default::default();
@@ -968,12 +981,19 @@ fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(home) else {
         return found;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.as_bytes().starts_with(b".") && name != ".cache" {
-            pending.push((entry.path(), 1));
+    let top: Vec<(PathBuf, bool)> = entries
+        .flatten()
+        .map(|e| {
+            let dot = e.file_name().as_bytes().starts_with(b".");
+            (e.path(), dot)
+        })
+        .collect();
+    for (path, dot) in &top {
+        if *dot && path.file_name() != Some(OsStr::new(".cache")) {
+            pending.push((path.clone(), 1));
         }
     }
+    let keep = |path: &Path| path.starts_with(cwd) && !home.starts_with(path);
     while let Some((path, depth)) = pending.pop() {
         if budget == 0 {
             tracing::warn!(
@@ -988,12 +1008,8 @@ fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
             continue;
         };
         if meta.file_type().is_symlink() {
-            if let Ok(target) = path.canonicalize()
-                && target.starts_with(cwd)
-                && !home.starts_with(&target)
-            {
-                found.push(target);
-            }
+            let (links, target) = symlink_chain(&path);
+            found.extend(links.into_iter().chain(target).filter(|p| keep(p)));
         } else if meta.is_file() && meta.nlink() > 1 {
             linked.insert((meta.dev(), meta.ino()));
         } else if meta.is_dir()
@@ -1003,19 +1019,90 @@ fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
             pending.extend(entries.flatten().map(|e| (e.path(), depth + 1)));
         }
     }
-    if !linked.is_empty()
-        && let Ok(entries) = std::fs::read_dir(home)
-    {
-        for entry in entries.flatten() {
-            let visible = !entry.file_name().as_bytes().starts_with(b".");
-            if visible && entry.file_type().is_ok_and(|t| !t.is_symlink()) {
-                // Out of descriptors: keep what was found; the rest of the
-                // aliases stay writable, as with an unscanned depth.
-                let _ = find_hardlink_aliases(cwd, &entry.path(), &linked, &mut found);
+    if !linked.is_empty() {
+        let mut budget = ALIAS_SCAN_MAX_ENTRIES;
+        let mut pending: Vec<PathBuf> = top
+            .into_iter()
+            .filter(|(_, dot)| !dot)
+            .map(|(path, _)| path)
+            .collect();
+        while let Some(path) = pending.pop() {
+            if budget == 0 {
+                tracing::warn!(
+                    home = %home.display(),
+                    "stopped searching $HOME for hard links to dotfiles after \
+                     {ALIAS_SCAN_MAX_ENTRIES} entries; aliases beyond them stay writable"
+                );
+                break;
+            }
+            budget -= 1;
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            if meta.is_file() && linked.contains(&(meta.dev(), meta.ino())) {
+                found.push(path);
+            } else if meta.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&path)
+            {
+                pending.extend(entries.flatten().map(|e| e.path()));
             }
         }
     }
     found
+}
+
+/// Resolves the symlink at `start` one component at a time, like
+/// `realpath`, and returns every symlink met on the way (including
+/// `start` and directory links inside a target path) with the final
+/// target, or `None` for a dangling or looping chain. Re-pointing any of
+/// those links would re-point the dot entry, so all of them are kept.
+fn symlink_chain(start: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+    use std::collections::VecDeque;
+    use std::path::Component;
+    let mut links = Vec::new();
+    let mut resolved = PathBuf::from("/");
+    let mut rest: VecDeque<OsString> = start
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            _ => None,
+        })
+        .collect();
+    let mut hops = 0;
+    while let Some(name) = rest.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let Ok(meta) = candidate.symlink_metadata() else {
+            return (links, None);
+        };
+        if !meta.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        hops += 1;
+        let Ok(target) = std::fs::read_link(&candidate) else {
+            return (links, None);
+        };
+        if hops > 40 {
+            return (links, None);
+        }
+        links.push(candidate);
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        for component in target.components().rev() {
+            match component {
+                Component::Normal(name) => rest.push_front(name.to_os_string()),
+                Component::ParentDir => rest.push_front(OsString::from("..")),
+                _ => {}
+            }
+        }
+    }
+    (links, Some(resolved))
 }
 
 /// The write grant for a `$HOME` that `cwd` covers. Everything a login,
@@ -1037,6 +1124,7 @@ fn grant_covered_home(
     cwd: &Path,
     home: &Path,
     deny_paths: &[PathBuf],
+    locked: &[PathBuf],
     sink: &mut dyn RuleSink,
 ) -> Result<(), BuildError> {
     if deny_paths.iter().any(|denied| home.starts_with(denied)) {
@@ -1051,7 +1139,14 @@ fn grant_covered_home(
         return Ok(());
     };
     sink.add(home, dir.as_fd(), true, AccessFs::ReadDir.into())?;
-    grant_children_excluding(home, dir.as_fd(), deny_paths, &home_entry_level, sink)
+    grant_children_excluding(
+        home,
+        dir.as_fd(),
+        deny_paths,
+        locked,
+        &home_entry_level,
+        sink,
+    )
 }
 
 fn home_entry_level(name: &OsStr) -> Level {
@@ -1186,6 +1281,7 @@ fn grant_paths_excluding(
     cwd: &Path,
     root: &Path,
     deny_paths: &[PathBuf],
+    locked: &[PathBuf],
     level: Level,
     sink: &mut dyn RuleSink,
 ) -> Result<(), BuildError> {
@@ -1208,7 +1304,7 @@ fn grant_paths_excluding(
     else {
         return Ok(());
     };
-    grant_dir_excluding(root, dir.as_fd(), deny_paths, level, sink)
+    grant_dir_excluding(root, dir.as_fd(), deny_paths, locked, level, sink)
 }
 
 /// The enumerating half of `grant_paths_excluding`, for a directory
@@ -1228,26 +1324,30 @@ fn grant_dir_excluding(
     path: &Path,
     dir: BorrowedFd<'_>,
     deny_paths: &[PathBuf],
+    locked: &[PathBuf],
     level: Level,
     sink: &mut dyn RuleSink,
 ) -> Result<(), BuildError> {
     // Landlock rights are inherited by everything beneath a rule's inode,
     // so `level.dir_only`'s create rights here would also apply inside an
-    // excluded *directory* below (a denied dir, or a covered `$HOME`):
-    // `ln -s` or `mkdir` could plant entries in it. Such a directory gets
-    // list rights only.
-    let below_is_excluded_dir = deny_paths.iter().any(|denied| {
-        denied.as_path() != path
-            && denied.starts_with(path)
-            && denied.symlink_metadata().is_ok_and(|m| m.is_dir())
+    // excluded directory below: `ln -s` or `mkdir` could plant entries in
+    // it. For a `locked` directory (a covered `$HOME`, a home secret store,
+    // a dotfile target; see `add_grants`) that is persistence, so every
+    // directory above one gets list rights only. Other denied directories
+    // keep the old behaviour (documented limit): something can be planted
+    // in them, not read from them.
+    let above_locked_dir = locked.iter().any(|entry| {
+        entry.as_path() != path
+            && entry.starts_with(path)
+            && entry.symlink_metadata().is_ok_and(|m| m.is_dir())
     });
-    let dir_access = if below_is_excluded_dir {
+    let dir_access = if above_locked_dir {
         AccessFs::ReadDir.into()
     } else {
         level.dir_only
     };
     sink.add(path, dir, true, dir_access)?;
-    grant_children_excluding(path, dir, deny_paths, &|_| level, sink)
+    grant_children_excluding(path, dir, deny_paths, locked, &|_| level, sink)
 }
 
 /// The per-child half of `grant_dir_excluding`: grants each entry of the
@@ -1257,6 +1357,7 @@ fn grant_children_excluding(
     path: &Path,
     dir: BorrowedFd<'_>,
     deny_paths: &[PathBuf],
+    locked: &[PathBuf],
     child_level: &dyn Fn(&OsStr) -> Level,
     sink: &mut dyn RuleSink,
 ) -> Result<(), BuildError> {
@@ -1272,7 +1373,7 @@ fn grant_children_excluding(
         }
         if relevant.iter().any(|denied| denied.starts_with(&child)) {
             if let Some(subdir) = open_subdir(dir, &name)? {
-                grant_dir_excluding(&child, subdir.as_fd(), deny_paths, level, sink)?;
+                grant_dir_excluding(&child, subdir.as_fd(), deny_paths, locked, level, sink)?;
             }
             continue;
         }
@@ -2951,22 +3052,17 @@ mod tests {
         assert_nothing_planted_in_home(home.path(), home.path()).await;
     }
 
-    /// Review M4: the same inheritance plants into a denied directory.
+    /// Review R4: the planting lock is only for a covered `$HOME`; a
+    /// project with a denied directory keeps creating entries at its root.
     #[tokio::test]
-    async fn nothing_can_be_planted_in_a_denied_directory() {
+    async fn a_denied_directory_in_a_project_does_not_lock_the_project_root() {
         let dir = fixture_dir();
         std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key"), "FAKE").unwrap();
         let confiner = LandlockConfiner::new(dir.path(), &[], &[dir.path().join("secrets")], true);
 
-        sh_succeeds(&confiner, dir.path(), "ln -s /x secrets/planted").await;
-        sh_succeeds(&confiner, dir.path(), "mkdir secrets/sub").await;
-        assert!(
-            dir.path()
-                .join("secrets/planted")
-                .symlink_metadata()
-                .is_err()
-        );
-        assert!(dir.path().join("secrets/sub").symlink_metadata().is_err());
+        assert!(sh_succeeds(&confiner, dir.path(), "mkdir target").await);
+        assert!(!cat_succeeds(&confiner, &dir.path().join("secrets/key")).await);
     }
 
     /// Review I1: stow-style dotfiles live in a visible directory.
@@ -3008,6 +3104,100 @@ mod tests {
             command.current_dir(h).arg("-c").arg(script);
             assert!(run(command).await.0, "control: `{script}` fails unconfined");
         }
+    }
+
+    /// Runs `script` unconfined in `cwd` and asserts it works (control).
+    async fn control_succeeds(cwd: &Path, script: &str) {
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(cwd).arg("-c").arg(script);
+        let (success, output) = run(command).await;
+        assert!(success, "control: `{script}` fails unconfined: {output}");
+    }
+
+    /// Review R1: every link on the way to a dotfile is protected, not
+    /// only the final target.
+    #[tokio::test]
+    async fn at_home_root_a_dotfile_symlink_chain_cannot_be_repointed() {
+        let make = || {
+            let home = fake_home();
+            let h = home.path();
+            for dir in ["X", "Y", "Z", "W"] {
+                std::fs::create_dir(h.join(dir)).unwrap();
+            }
+            std::fs::write(h.join("Y/zshrc"), "# z").unwrap();
+            std::fs::write(h.join("Y/bashrc"), "# b").unwrap();
+            std::fs::write(h.join("Z/evil"), "EVIL").unwrap();
+            std::fs::write(h.join("Z/bashrc"), "EVIL").unwrap();
+            // A file link in the middle, and a directory link on the way.
+            std::os::unix::fs::symlink("X/ptr", h.join(".zshrc")).unwrap();
+            std::os::unix::fs::symlink("../Y/zshrc", h.join("X/ptr")).unwrap();
+            std::os::unix::fs::symlink("../Y", h.join("W/dir")).unwrap();
+            std::fs::remove_file(h.join(".bashrc")).unwrap();
+            std::os::unix::fs::symlink("W/dir/bashrc", h.join(".bashrc")).unwrap();
+            home
+        };
+        let scripts = ["ln -sfn ../Z/evil X/ptr", "ln -sfn ../Z W/dir"];
+        for script in scripts {
+            control_succeeds(make().path(), script).await;
+        }
+        let home = make();
+        let h = home.path();
+        let confiner = confiner_at_home(h, h);
+        for script in scripts {
+            sh_succeeds(&confiner, h, script).await;
+        }
+        assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap(), "# z");
+        assert_eq!(std::fs::read_to_string(h.join(".bashrc")).unwrap(), "# b");
+    }
+
+    /// Review R2: an alias directly in `$HOME`.
+    #[tokio::test]
+    async fn at_home_root_a_hard_link_directly_in_home_is_read_only() {
+        let home = fake_home();
+        let h = home.path();
+        std::fs::write(h.join(".profile"), "# p").unwrap();
+        std::fs::hard_link(h.join(".profile"), h.join("profile-copy")).unwrap();
+        let confiner = confiner_at_home(h, h);
+
+        assert!(!sh_succeeds(&confiner, h, "echo evil >> profile-copy").await);
+        assert_eq!(std::fs::read_to_string(h.join(".profile")).unwrap(), "# p");
+        control_succeeds(h, "echo ok >> profile-copy").await;
+    }
+
+    /// Review R3: systemd user units and `.desktop` files are linked from
+    /// deep inside the dot entries.
+    #[tokio::test]
+    async fn at_home_root_deeply_linked_units_stay_read_only() {
+        let home = fake_home();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("Projects/svc")).unwrap();
+        std::fs::create_dir_all(h.join(".config/systemd/user/default.target.wants")).unwrap();
+        std::fs::create_dir_all(h.join(".local/share/applications")).unwrap();
+        for f in ["a.service", "b.service", "c.desktop"] {
+            std::fs::write(h.join("Projects/svc").join(f), "[Unit]").unwrap();
+        }
+        let link = |target: &str, at: &str| {
+            std::os::unix::fs::symlink(h.join(target), h.join(at)).unwrap()
+        };
+        link("Projects/svc/a.service", ".config/systemd/user/a.service");
+        link(
+            "Projects/svc/b.service",
+            ".config/systemd/user/default.target.wants/b.service",
+        );
+        link(
+            "Projects/svc/c.desktop",
+            ".local/share/applications/c.desktop",
+        );
+        let confiner = confiner_at_home(h, h);
+
+        for f in ["a.service", "b.service", "c.desktop"] {
+            let script = format!("echo ExecStart=evil >> Projects/svc/{f}");
+            assert!(
+                !sh_succeeds(&confiner, h, &script).await,
+                "`{script}` succeeded"
+            );
+        }
+        control_succeeds(h, "echo ok >> Projects/svc/a.service").await;
     }
 
     /// Review I1: a hard link shares the dot file's inode.
@@ -3061,6 +3251,17 @@ mod tests {
         })
         .await;
         assert!(readable, "control: unreadable even unconfined");
+    }
+
+    /// Manual: `cargo test scan_cost -- --ignored --nocapture`. Times the
+    /// construction-time scan of the real `$HOME` (metadata only).
+    #[test]
+    #[ignore]
+    fn scan_cost_on_the_real_home() {
+        let home = user_home().unwrap();
+        let start = std::time::Instant::now();
+        let found = scan_dot_entries(&home, &home);
+        eprintln!("scan: {} entries in {:?}", found.len(), start.elapsed());
     }
 
     #[test]
@@ -3788,7 +3989,8 @@ mod tests {
     fn grant_paths_excluding_returns_root_unchanged_when_nothing_is_denied() {
         let dir = fixture_dir();
         let mut grants = Recorder::default();
-        grant_paths_excluding(dir.path(), dir.path(), &[], Level::read(), &mut grants).unwrap();
+        grant_paths_excluding(dir.path(), dir.path(), &[], &[], Level::read(), &mut grants)
+            .unwrap();
         assert_eq!(grants.full, vec![dir.path().to_path_buf()]);
         assert!(grants.dir_only.is_empty());
     }
@@ -3798,7 +4000,15 @@ mod tests {
         let dir = fixture_dir();
         let mut grants = Recorder::default();
         let deny = [dir.path().to_path_buf()];
-        grant_paths_excluding(dir.path(), dir.path(), &deny, Level::read(), &mut grants).unwrap();
+        grant_paths_excluding(
+            dir.path(),
+            dir.path(),
+            &deny,
+            &[],
+            Level::read(),
+            &mut grants,
+        )
+        .unwrap();
         assert!(grants.full.is_empty() && grants.dir_only.is_empty());
     }
 

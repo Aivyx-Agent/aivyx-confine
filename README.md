@@ -32,10 +32,7 @@ denied file that appears later is still denied.
   basename globs (`.env`, `*.pem`, matched anywhere under `cwd` and
   `extra_read_paths`) are carved out of every grant. Roots and entries are
   compared in canonical form. Hard-link aliases of a denied file under
-  those roots are denied too. A carved directory with a denied
-  *directory* anywhere below it gets list rights only (no create):
-  Landlock rights are inherited, so create rights there would let `ln -s`
-  or `mkdir` plant entries inside the denied directory. `~/.cargo/credentials(.toml)`,
+  those roots are denied too. `~/.cargo/credentials(.toml)`,
   `~/.config/git/credentials` and `~/.git-credentials` are always denied,
   and so is every other home secret store a covered `$HOME` would expose
   (next item). A directory that had to
@@ -53,11 +50,14 @@ denied file that appears later is still denied.
     `~/.zshenv` is as good a persistence target as an existing one.
   - Every dot entry (`.bashrc`, `.profile`, `.config/**`, `.local/**`,
     ...) and `~/bin`: read-only. So are the targets of symlinked dot
-    entries inside `cwd` (stow-style `~/.zshrc -> dotfiles/zshrc`) and
-    hard-link aliases of dot files under `$HOME`'s visible entries (found
-    down to `~/.a/b/c`, `.cache` skipped, when the confiner is built).
-  - Every directory between `cwd` and `$HOME` (`/`, `/home`): list only,
-    as for any carved directory above a denied one.
+    entries inside `cwd` (stow-style `~/.zshrc -> dotfiles/zshrc`, every
+    link along the way included) and hard-link aliases of dot files under
+    `$HOME`'s visible entries. They are found once, when the confiner is
+    built, down to six levels into the dot entries (`.cache` skipped).
+  - Every directory above `$HOME`, a secret store or a dotfile target
+    (`/`, `/home`, `~/dotfiles`): list only. Landlock rights are
+    inherited, so create rights there would let `ln -s` or `mkdir` plant
+    entries below.
   - Every other entry (`Documents`, `Projects`, ...): read and write as
     before.
   - Secret stores: no access at all — `.ssh`, `.gnupg`, `.aws`, `.azure`,
@@ -107,8 +107,10 @@ denied file that appears later is still denied.
   readable. Visible directories are still writable, and some code there
   runs later by itself: git hooks of other repos under `~/Projects`,
   `.envrc` files with direnv, `~/go/bin` and similar on `PATH`. Symlinked
-  or hard-linked dotfiles deeper than the scan, or changed after the
-  confiner was built, are not covered. A `TMPDIR` inside a covered
+  or hard-linked dotfiles deeper than the scan, beyond its entry budget
+  (20,000 dot entries, 100,000 for the alias search), or linked after the
+  confiner was built (a long-lived confiner keeps its first result) are
+  not covered. A `TMPDIR` inside a covered
   `$HOME`'s dot entries (`~/.cache/tmp`) is not writable. Run the agent
   in a project directory where possible.
 
@@ -124,6 +126,11 @@ denied file that appears later is still denied.
   unaffected. That includes litter the agent made itself: after
   `ln .env y` in the root, `y` is denied (a hard-link alias) and can never
   be deleted from inside the sandbox.
+- **Planting into a denied directory.** A denied directory inside a
+  granted root (a consumer's `secrets/`) cannot be read, but its carved
+  parent's create rights are inherited by it, so `ln -s`, `mkfifo` or an
+  empty file can still appear inside it. Only a covered `$HOME`'s
+  protected places (above) are locked against this.
 - **Descriptors and depth.** Building the ruleset holds one descriptor
   per directory level it descends into. A repository with a denied file
   nested about a thousand directories deep can therefore exhaust a 1024
@@ -173,9 +180,9 @@ Mostly confiners whose `cwd` covers `$HOME` change (see "`cwd` covering
 `$HOME`" above). For them, a command that creates, removes or renames an
 entry directly in `~` (or in a directory between `cwd` and `~`), or
 writes any dot entry, a dotfile's target or `~/bin`, now fails with
-`EACCES`, and the listed secret stores are unreadable. For every `cwd`,
-a carved directory above a denied directory no longer allows creating
-entries in it. The secret
+`EACCES`, and the listed secret stores are unreadable. A directory that
+holds a dotfile target or a symlinked secret store (`~/dotfiles`)
+no longer allows creating entries in it. The secret
 stores are also carved out of any `extra_read_paths` entry that reaches
 them, for every `cwd`; an entry (or a `cwd`) *inside* one is no longer
 granted.

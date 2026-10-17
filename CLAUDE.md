@@ -97,10 +97,12 @@ without Landlock):
   itself (no create/remove/rename — a missing rc file is a persistence
   target), dot entries, `~/bin` and dotfile targets/hard-link aliases
   found at construction (`scan_dot_entries`) read-only, other entries
-  writable. A carved directory with an excluded *directory* below it
-  (including every directory between `cwd` and a covered `$HOME`) gets
+  writable. A carved directory above a `locked` directory (a covered
+  `$HOME`, a home secret store, a dotfile target; `add_grants`) gets
   `ReadDir` only: Landlock rights are inherited, so its create rights
-  would reach into the excluded directory. Seccomp is three stacked
+  would reach into it. Other denied directories are deliberately not
+  locked, so a project with a denied dir keeps creating entries at its
+  root. Seccomp is three stacked
   filters (`build_seccomp_filters`): the `EPERM` denylist (incl.
   namespace `clone` flags, the new mount API and, by default,
   `setsid`/`setpgid`, `socket(AF_UNIX)` and AF_UNIX datagram
