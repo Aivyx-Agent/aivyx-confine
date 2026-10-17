@@ -549,8 +549,13 @@ impl LandlockConfiner {
             (Some(home), Some(_)) => &home.read_only,
             _ => &[],
         };
+        let missing: &[PathBuf] = match (&self.home, covered_home) {
+            (Some(home), Some(_)) => &home.missing,
+            _ => &[],
+        };
         let mut home_excluded = deny_paths.to_vec();
         home_excluded.extend(read_only.iter().cloned());
+        home_excluded.extend(missing.iter().cloned());
         let mut write_excluded = home_excluded.clone();
         write_excluded.extend(covered_home.cloned());
         // What nothing may be planted into (see `grant_dir_excluding`):
@@ -558,8 +563,14 @@ impl LandlockConfiner {
         let mut locked: Vec<PathBuf> = Vec::new();
         if let (Some(home), Some(covered)) = (&self.home, covered_home) {
             locked.push(covered.clone());
-            locked.extend(home.credentials.iter().cloned());
+            locked.extend(
+                home.credentials
+                    .iter()
+                    .filter(|p| p.symlink_metadata().is_ok())
+                    .cloned(),
+            );
             locked.extend(home.read_only.iter().cloned());
+            locked.extend(home.missing.iter().cloned());
         }
         for root in &write_roots {
             grant_paths_excluding(cwd, root, &write_excluded, &locked, Level::write(), sink)?;
@@ -892,6 +903,11 @@ struct HomePaths {
     /// aliases of dot files. They are cut out of the write grants and
     /// granted read-only. See `scan_dot_entries`.
     read_only: Vec<PathBuf>,
+    /// With `covered`: the first missing path of each dangling dotfile
+    /// chain (`~/.zshenv -> Projects/dotfiles/zshenv`, not there yet).
+    /// Every directory above one gets list rights only, so the sandbox
+    /// can't create it.
+    missing: Vec<PathBuf>,
 }
 
 impl HomePaths {
@@ -941,45 +957,89 @@ impl HomePaths {
             }
             credentials.push(given);
         }
-        let read_only = match &covered {
-            Some(home) => scan_dot_entries(&canonical_cwd, home),
-            None => Vec::new(),
+        let scan = match &covered {
+            Some(home) => scan_dot_entries(&canonical_cwd, home, &credentials),
+            None => DotScan::default(),
         };
         Self {
             roots,
             credentials,
             covered,
-            read_only,
+            read_only: scan.read_only,
+            missing: scan.missing,
         }
     }
 }
 
 /// How deep `scan_dot_entries` looks into `$HOME`'s dot entries
 /// (`~/.a/b/c` is depth 3; `~/.config/systemd/user/x.target.wants/y` is
-/// 5), and how many entries it reads at most there and in the visible
-/// trees searched for hard-link aliases.
+/// 5), and how many entries it reads at most: in the persistence places,
+/// in the other dot entries, and in the visible trees searched for
+/// hard-link aliases.
 const DOT_SCAN_DEPTH: usize = 6;
 const DOT_SCAN_MAX_ENTRIES: usize = 20_000;
 const ALIAS_SCAN_MAX_ENTRIES: usize = 100_000;
 
-/// Finds what a covered `$HOME`'s dot entries reach outside themselves
-/// (`HomePaths::read_only`), for every symlink among them down to
-/// `DOT_SCAN_DEPTH` (`.cache` skipped): each symlink passed on the way to
-/// the final target, and the target itself (`symlink_chain`), when inside
-/// `cwd` and not `$HOME` or an ancestor of it. Plus every hard-link alias,
-/// under `$HOME`'s visible entries, of a dot file with more than one link.
+/// Dot entries that start code by themselves, scanned first with their
+/// own budget so a bulky sibling can't use it up.
+const DOT_SCAN_FIRST: &[&str] = &[
+    ".config/systemd",
+    ".config/autostart",
+    ".config/environment.d",
+    ".local/bin",
+    ".local/share/applications",
+    ".local/share/systemd",
+];
+
+/// Bulky dot trees that hold caches, downloads and toolchains rather than
+/// configuration; never scanned.
+const DOT_SCAN_SKIP: &[&str] = &[
+    ".cache",
+    ".cargo/registry",
+    ".cargo/git",
+    ".rustup/toolchains",
+    ".rustup/downloads",
+    ".npm",
+    ".var",
+    ".local/share/Trash",
+    ".local/share/Steam",
+    ".config/Code/Cache",
+    ".config/Code/CachedData",
+    ".config/Code/workspaceStorage",
+];
+
+/// What `scan_dot_entries` found.
+#[derive(Default)]
+struct DotScan {
+    /// See `HomePaths::read_only`.
+    read_only: Vec<PathBuf>,
+    /// The first missing path of each dangling chain (see `HomePaths::missing`).
+    missing: Vec<PathBuf>,
+    /// A budget ran out (also logged).
+    truncated: bool,
+}
+
+/// Finds what a covered `$HOME`'s dot entries reach outside themselves.
+/// For every symlink among them (down to `DOT_SCAN_DEPTH`, breadth first,
+/// `DOT_SCAN_FIRST` before the rest, `DOT_SCAN_SKIP` never): each symlink
+/// passed on the way to the final target, and the target itself
+/// (`symlink_chain`), when inside `cwd` and not `$HOME` or an ancestor of
+/// it; a target directory is scanned in turn. A dangling chain's first
+/// missing path goes to `missing`. Then every hard-link alias, under
+/// `$HOME`'s visible entries, of a scanned file with more than one link.
+///
 /// Runs once, when the confiner is built: nothing under a covered
 /// `$HOME`'s dot entries can be changed from inside the sandbox, and each
 /// result's carved parents lose rename/remove rights, so the result stays
 /// true for this confiner's spawns. The walks are path-based; anything
-/// they get wrong only adds read-only carve-outs, never a grant.
-fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut linked: std::collections::HashSet<(u64, u64)> = Default::default();
-    let mut budget = DOT_SCAN_MAX_ENTRIES;
-    let mut pending: Vec<(PathBuf, usize)> = Vec::new();
+/// they get wrong only adds carve-outs, never a grant.
+fn scan_dot_entries(cwd: &Path, home: &Path, denied: &[PathBuf]) -> DotScan {
+    use std::collections::{HashSet, VecDeque};
+    let mut scan = DotScan::default();
+    let mut linked: HashSet<(u64, u64)> = HashSet::new();
+    let mut visited: HashSet<(u64, u64)> = HashSet::new();
     let Ok(entries) = std::fs::read_dir(home) else {
-        return found;
+        return scan;
     };
     let top: Vec<(PathBuf, bool)> = entries
         .flatten()
@@ -988,51 +1048,98 @@ fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
             (e.path(), dot)
         })
         .collect();
-    for (path, dot) in &top {
-        if *dot && path.file_name() != Some(OsStr::new(".cache")) {
-            pending.push((path.clone(), 1));
-        }
-    }
+    let first: Vec<PathBuf> = DOT_SCAN_FIRST.iter().map(|p| home.join(p)).collect();
+    // Denied secret stores are unreachable anyway.
+    let skip: Vec<PathBuf> = DOT_SCAN_SKIP
+        .iter()
+        .map(|p| home.join(p))
+        .chain(denied.iter().cloned())
+        .collect();
     let keep = |path: &Path| path.starts_with(cwd) && !home.starts_with(path);
-    while let Some((path, depth)) = pending.pop() {
-        if budget == 0 {
-            tracing::warn!(
-                home = %home.display(),
-                "stopped scanning $HOME's dot entries after {DOT_SCAN_MAX_ENTRIES} entries; \
-                 symlinked or hard-linked dotfiles beyond them stay writable at their target"
-            );
-            break;
-        }
-        budget -= 1;
-        let Ok(meta) = path.symlink_metadata() else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            let (links, target) = symlink_chain(&path);
-            found.extend(links.into_iter().chain(target).filter(|p| keep(p)));
-        } else if meta.is_file() && meta.nlink() > 1 {
-            linked.insert((meta.dev(), meta.ino()));
-        } else if meta.is_dir()
-            && depth < DOT_SCAN_DEPTH
-            && let Ok(entries) = std::fs::read_dir(&path)
-        {
-            pending.extend(entries.flatten().map(|e| (e.path(), depth + 1)));
+    let passes: [Vec<(PathBuf, usize)>; 2] = [
+        first
+            .iter()
+            .map(|p| {
+                (
+                    p.clone(),
+                    p.strip_prefix(home).map_or(1, |r| r.components().count()),
+                )
+            })
+            .collect(),
+        top.iter()
+            .filter(|(_, dot)| *dot)
+            .map(|(p, _)| (p.clone(), 1))
+            .collect(),
+    ];
+    for (pass, roots) in passes.into_iter().enumerate() {
+        let mut budget = DOT_SCAN_MAX_ENTRIES;
+        let mut queue: VecDeque<(PathBuf, usize)> = roots.into();
+        while let Some((path, depth)) = queue.pop_front() {
+            if skip.iter().any(|s| path.starts_with(s))
+                || (pass == 1 && first.iter().any(|f| path.starts_with(f)))
+            {
+                continue;
+            }
+            if budget == 0 {
+                tracing::warn!(
+                    home = %home.display(),
+                    "stopped scanning $HOME's dot entries after {DOT_SCAN_MAX_ENTRIES} \
+                     entries; symlinked or hard-linked dotfiles beyond them stay writable \
+                     at their target"
+                );
+                scan.truncated = true;
+                break;
+            }
+            budget -= 1;
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            let mut dir = meta.is_dir().then(|| path.clone());
+            if meta.file_type().is_symlink() {
+                let (links, end) = symlink_chain(&path);
+                scan.read_only.extend(links.into_iter().filter(|p| keep(p)));
+                match end {
+                    ChainEnd::Target(target) if keep(&target) => {
+                        if let Ok(target_meta) = target.metadata() {
+                            if target_meta.is_dir() {
+                                dir = Some(target.clone());
+                            } else if target_meta.nlink() > 1 {
+                                linked.insert((target_meta.dev(), target_meta.ino()));
+                            }
+                        }
+                        scan.read_only.push(target);
+                    }
+                    ChainEnd::Missing(missing) if keep(&missing) => scan.missing.push(missing),
+                    _ => {}
+                }
+            } else if meta.is_file() && meta.nlink() > 1 {
+                linked.insert((meta.dev(), meta.ino()));
+            }
+            if let Some(dir) = dir
+                && depth < DOT_SCAN_DEPTH
+                && let Ok(dir_meta) = dir.metadata()
+                && visited.insert((dir_meta.dev(), dir_meta.ino()))
+                && let Ok(entries) = std::fs::read_dir(&dir)
+            {
+                queue.extend(entries.flatten().map(|e| (e.path(), depth + 1)));
+            }
         }
     }
     if !linked.is_empty() {
         let mut budget = ALIAS_SCAN_MAX_ENTRIES;
-        let mut pending: Vec<PathBuf> = top
+        let mut queue: VecDeque<PathBuf> = top
             .into_iter()
             .filter(|(_, dot)| !dot)
             .map(|(path, _)| path)
             .collect();
-        while let Some(path) = pending.pop() {
+        while let Some(path) = queue.pop_front() {
             if budget == 0 {
                 tracing::warn!(
                     home = %home.display(),
                     "stopped searching $HOME for hard links to dotfiles after \
                      {ALIAS_SCAN_MAX_ENTRIES} entries; aliases beyond them stay writable"
                 );
+                scan.truncated = true;
                 break;
             }
             budget -= 1;
@@ -1040,23 +1147,33 @@ fn scan_dot_entries(cwd: &Path, home: &Path) -> Vec<PathBuf> {
                 continue;
             };
             if meta.is_file() && linked.contains(&(meta.dev(), meta.ino())) {
-                found.push(path);
+                scan.read_only.push(path);
             } else if meta.is_dir()
                 && let Ok(entries) = std::fs::read_dir(&path)
             {
-                pending.extend(entries.flatten().map(|e| e.path()));
+                queue.extend(entries.flatten().map(|e| e.path()));
             }
         }
     }
-    found
+    scan
+}
+
+/// Where a symlink chain ends.
+enum ChainEnd {
+    /// An existing path.
+    Target(PathBuf),
+    /// The first component that doesn't exist (a dangling chain).
+    Missing(PathBuf),
+    /// A loop, an unreadable link or too many hops.
+    Unresolved,
 }
 
 /// Resolves the symlink at `start` one component at a time, like
 /// `realpath`, and returns every symlink met on the way (including
-/// `start` and directory links inside a target path) with the final
-/// target, or `None` for a dangling or looping chain. Re-pointing any of
-/// those links would re-point the dot entry, so all of them are kept.
-fn symlink_chain(start: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+/// `start` and directory links inside a target path) with where the
+/// chain ends. Re-pointing any of those links would re-point the dot
+/// entry, so all of them are kept.
+fn symlink_chain(start: &Path) -> (Vec<PathBuf>, ChainEnd) {
     use std::collections::VecDeque;
     use std::path::Component;
     let mut links = Vec::new();
@@ -1077,7 +1194,7 @@ fn symlink_chain(start: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
         }
         let candidate = resolved.join(&name);
         let Ok(meta) = candidate.symlink_metadata() else {
-            return (links, None);
+            return (links, ChainEnd::Missing(candidate));
         };
         if !meta.file_type().is_symlink() {
             resolved = candidate;
@@ -1085,10 +1202,10 @@ fn symlink_chain(start: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
         }
         hops += 1;
         let Ok(target) = std::fs::read_link(&candidate) else {
-            return (links, None);
+            return (links, ChainEnd::Unresolved);
         };
         if hops > 40 {
-            return (links, None);
+            return (links, ChainEnd::Unresolved);
         }
         links.push(candidate);
         if target.is_absolute() {
@@ -1102,7 +1219,7 @@ fn symlink_chain(start: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
             }
         }
     }
-    (links, Some(resolved))
+    (links, ChainEnd::Target(resolved))
 }
 
 /// The write grant for a `$HOME` that `cwd` covers. Everything a login,
@@ -1336,10 +1453,12 @@ fn grant_dir_excluding(
     // directory above one gets list rights only. Other denied directories
     // keep the old behaviour (documented limit): something can be planted
     // in them, not read from them.
+    // A locked path that doesn't exist (a dangling dotfile chain's next
+    // step) locks every directory above it, so it can't be created.
     let above_locked_dir = locked.iter().any(|entry| {
         entry.as_path() != path
             && entry.starts_with(path)
-            && entry.symlink_metadata().is_ok_and(|m| m.is_dir())
+            && entry.symlink_metadata().map_or(true, |m| m.is_dir())
     });
     let dir_access = if above_locked_dir {
         AccessFs::ReadDir.into()
@@ -3150,6 +3269,85 @@ mod tests {
         assert_eq!(std::fs::read_to_string(h.join(".bashrc")).unwrap(), "# b");
     }
 
+    /// Review P1: a dangling dotfile link must not be completable.
+    #[tokio::test]
+    async fn at_home_root_a_dangling_dotfile_link_cannot_be_completed() {
+        let make = || {
+            let home = fake_home();
+            let h = home.path();
+            std::fs::create_dir_all(h.join("Projects/dotfiles")).unwrap();
+            std::fs::write(h.join("Projects/evil.sh"), "EVIL").unwrap();
+            std::os::unix::fs::symlink("Projects/dotfiles/zshenv", h.join(".zshenv")).unwrap();
+            std::os::unix::fs::symlink("Projects/gone/zlogin", h.join(".zlogin")).unwrap();
+            home
+        };
+        let scripts = [
+            "ln -s ../evil.sh Projects/dotfiles/zshenv",
+            "mkdir Projects/gone && ln -s ../evil.sh Projects/gone/zlogin",
+        ];
+        for script in scripts {
+            control_succeeds(make().path(), script).await;
+        }
+        let home = make();
+        let h = home.path();
+        let confiner = confiner_at_home(h, h);
+        for script in scripts {
+            sh_succeeds(&confiner, h, script).await;
+        }
+        assert!(std::fs::read_to_string(h.join(".zshenv")).is_err());
+        assert!(std::fs::read_to_string(h.join(".zlogin")).is_err());
+    }
+
+    /// Review P2: links inside a symlinked dotfile directory.
+    #[tokio::test]
+    async fn at_home_root_links_inside_a_linked_dotfile_dir_are_followed() {
+        let home = fake_home();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("Projects/dot/nvim")).unwrap();
+        std::fs::create_dir_all(h.join("Projects/dot/shared")).unwrap();
+        std::fs::write(h.join("Projects/dot/shared/init.lua"), "-- i").unwrap();
+        std::fs::write(h.join("Projects/dot/shared/h"), "-- h").unwrap();
+        std::os::unix::fs::symlink("../shared/init.lua", h.join("Projects/dot/nvim/init.lua"))
+            .unwrap();
+        std::fs::hard_link(
+            h.join("Projects/dot/shared/h"),
+            h.join("Projects/dot/nvim/h.lua"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(h.join("Projects/dot/nvim"), h.join(".config/nvim")).unwrap();
+        let confiner = confiner_at_home(h, h);
+
+        for script in [
+            "echo evil >> Projects/dot/shared/init.lua",
+            "echo evil >> Projects/dot/shared/h",
+        ] {
+            assert!(
+                !sh_succeeds(&confiner, h, script).await,
+                "`{script}` succeeded"
+            );
+        }
+        control_succeeds(h, "echo ok >> Projects/dot/shared/init.lua").await;
+    }
+
+    /// Review P3: a bulky dot directory must not use up the scan.
+    #[tokio::test]
+    async fn at_home_root_a_bulky_dot_dir_does_not_hide_a_bin_link() {
+        let home = fake_home();
+        let h = home.path();
+        let bulky = h.join(".config/Code/blobs");
+        std::fs::create_dir_all(&bulky).unwrap();
+        for i in 0..(DOT_SCAN_MAX_ENTRIES + 100) {
+            std::fs::write(bulky.join(i.to_string()), "").unwrap();
+        }
+        std::fs::create_dir_all(h.join("Projects/tool")).unwrap();
+        std::fs::write(h.join("Projects/tool/run"), "#!/bin/sh").unwrap();
+        std::os::unix::fs::symlink(h.join("Projects/tool/run"), h.join(".local/bin/run")).unwrap();
+        let confiner = confiner_at_home(h, h);
+
+        assert!(!sh_succeeds(&confiner, h, "echo evil >> Projects/tool/run").await);
+        control_succeeds(h, "echo ok >> Projects/tool/run").await;
+    }
+
     /// Review R2: an alias directly in `$HOME`.
     #[tokio::test]
     async fn at_home_root_a_hard_link_directly_in_home_is_read_only() {
@@ -3260,8 +3458,14 @@ mod tests {
     fn scan_cost_on_the_real_home() {
         let home = user_home().unwrap();
         let start = std::time::Instant::now();
-        let found = scan_dot_entries(&home, &home);
-        eprintln!("scan: {} entries in {:?}", found.len(), start.elapsed());
+        let found = scan_dot_entries(&home, &home, &[]);
+        eprintln!(
+            "scan: {} read-only, {} missing, truncated {} in {:?}",
+            found.read_only.len(),
+            found.missing.len(),
+            found.truncated,
+            start.elapsed()
+        );
     }
 
     #[test]

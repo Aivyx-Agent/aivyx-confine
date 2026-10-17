@@ -52,12 +52,21 @@ denied file that appears later is still denied.
     ...) and `~/bin`: read-only. So are the targets of symlinked dot
     entries inside `cwd` (stow-style `~/.zshrc -> dotfiles/zshrc`, every
     link along the way included) and hard-link aliases of dot files under
-    `$HOME`'s visible entries. They are found once, when the confiner is
-    built, down to six levels into the dot entries (`.cache` skipped).
-  - Every directory above `$HOME`, a secret store or a dotfile target
-    (`/`, `/home`, `~/dotfiles`): list only. Landlock rights are
-    inherited, so create rights there would let `ln -s` or `mkdir` plant
-    entries below.
+    `$HOME`'s visible entries. A linked directory is followed in turn,
+    and a dangling link (`~/.zshenv -> dotfiles/zshenv`, not there) can't
+    be completed. They are found once, when the confiner is built, down
+    to six levels into the dot entries: the places that start code by
+    themselves (`.config/systemd`, `.config/autostart`, `.local/bin`, ...)
+    first, then the rest breadth first, skipping caches, toolchains and
+    denied stores.
+  - Every directory above `$HOME`, a secret store, a dotfile target
+    *directory* or a dangling link's missing path (`/`, `/home`): list
+    only. Landlock rights are inherited, so create rights there would let
+    `ln -s` or `mkdir` plant entries below. With
+    `~/.config/nvim -> ~/Projects/dot/nvim`, nothing new can be created
+    directly in `~/Projects` or `~/Projects/dot` (existing entries stay
+    writable); a dotfile target *file*'s directory only loses rename and
+    remove.
   - Every other entry (`Documents`, `Projects`, ...): read and write as
     before.
   - Secret stores: no access at all — `.ssh`, `.gnupg`, `.aws`, `.azure`,
@@ -110,7 +119,8 @@ denied file that appears later is still denied.
   or hard-linked dotfiles deeper than the scan, beyond its entry budget
   (20,000 dot entries, 100,000 for the alias search), or linked after the
   confiner was built (a long-lived confiner keeps its first result) are
-  not covered. A `TMPDIR` inside a covered
+  not covered; nor is an alias hidden by renaming a directory while the
+  confiner is being built (only aliases the user made are at stake). A `TMPDIR` inside a covered
   `$HOME`'s dot entries (`~/.cache/tmp`) is not writable. Run the agent
   in a project directory where possible.
 
@@ -180,9 +190,9 @@ Mostly confiners whose `cwd` covers `$HOME` change (see "`cwd` covering
 `$HOME`" above). For them, a command that creates, removes or renames an
 entry directly in `~` (or in a directory between `cwd` and `~`), or
 writes any dot entry, a dotfile's target or `~/bin`, now fails with
-`EACCES`, and the listed secret stores are unreadable. A directory that
-holds a dotfile target or a symlinked secret store (`~/dotfiles`)
-no longer allows creating entries in it. The secret
+`EACCES`, and the listed secret stores are unreadable. Directories above
+a dotfile target directory, a symlinked secret store or a dangling
+dotfile link's missing path no longer allow creating entries in them. The secret
 stores are also carved out of any `extra_read_paths` entry that reaches
 them, for every `cwd`; an entry (or a `cwd`) *inside* one is no longer
 granted.
