@@ -2616,9 +2616,6 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command
             .current_dir(dir.path())
-<<<<<<< Updated upstream
-            .args(["-c", "ls . && touch newfile && mkdir newdir"]);
-=======
             // The new file has no rights of its own yet, so some `touch`
             // implementations (uutils) report EACCES after creating it;
             // what matters is that MakeReg let it come into existence.
@@ -2626,7 +2623,6 @@ mod tests {
                 "-c",
                 "ls . && { touch newfile || true; } && test -f newfile && mkdir newdir",
             ]);
->>>>>>> Stashed changes
         let (success, output) = run(confiner.confine(command)).await;
         assert!(success, "directory operations in the root failed: {output}");
         assert!(dir.path().join("newfile").exists());
@@ -2642,7 +2638,7 @@ mod tests {
         assert!(dir.path().join("Cargo.toml").exists());
         assert!(dir.path().join("src").is_dir());
 
-        // A later spawn re-computes the grants, so the file `touch`ed above
+        // A later spawn re-computes the grants, so the file created above
         // is now writable like any other non-denied entry.
         let mut command = tokio::process::Command::new("sh");
         command
