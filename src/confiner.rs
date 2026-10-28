@@ -2616,7 +2616,17 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command
             .current_dir(dir.path())
+<<<<<<< Updated upstream
             .args(["-c", "ls . && touch newfile && mkdir newdir"]);
+=======
+            // The new file has no rights of its own yet, so some `touch`
+            // implementations (uutils) report EACCES after creating it;
+            // what matters is that MakeReg let it come into existence.
+            .args([
+                "-c",
+                "ls . && { touch newfile || true; } && test -f newfile && mkdir newdir",
+            ]);
+>>>>>>> Stashed changes
         let (success, output) = run(confiner.confine(command)).await;
         assert!(success, "directory operations in the root failed: {output}");
         assert!(dir.path().join("newfile").exists());
