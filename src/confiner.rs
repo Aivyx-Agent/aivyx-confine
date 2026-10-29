@@ -341,6 +341,10 @@ pub struct LandlockConfiner {
     tmp: TmpPolicy,
     /// Installed in order in the child; see `build_seccomp_filters`.
     seccomp_programs: Vec<BpfProgram>,
+    /// Why the filters could not be built (an unsupported target
+    /// architecture). Every spawn is then refused: seccomp is part of the
+    /// confinement, so running without it is not an option.
+    seccomp_unavailable: Option<String>,
     require_enforcement: bool,
     /// Test hook: behave as if the Landlock ruleset could not be built.
     #[cfg(test)]
@@ -391,6 +395,14 @@ impl LandlockConfiner {
         let (bare, non_bare): (Vec<&PathBuf>, Vec<&PathBuf>) =
             deny_paths.iter().partition(|p| crate::is_bare_pattern(p));
 
+        let (seccomp_programs, seccomp_unavailable) = match build_seccomp_filters(&options) {
+            Ok(programs) => (programs, None),
+            Err(why) => {
+                tracing::error!(error = %why, "seccomp unavailable; confined spawns will be refused");
+                (Vec::new(), Some(why))
+            }
+        };
+
         Self {
             cwd: cwd.to_path_buf(),
             extra_read_paths: extra_read_paths.to_vec(),
@@ -400,7 +412,8 @@ impl LandlockConfiner {
             home: user_home().map(|home| HomePaths::new(&home, cwd)),
             scan_settle_secs: SCAN_CACHE_SETTLE_SECS,
             tmp: TmpPolicy::new(options.share_system_tmp),
-            seccomp_programs: build_seccomp_filters(&options),
+            seccomp_programs,
+            seccomp_unavailable,
             require_enforcement,
             #[cfg(test)]
             force_ruleset_failure: false,
@@ -1777,11 +1790,15 @@ const NAMESPACE_CLONE_FLAGS: &[libc::c_int] = &[
     libc::CLONE_NEWCGROUP,
 ];
 
-/// Index of `clone`'s flags argument: s390x swaps the first two.
-#[cfg(target_arch = "s390x")]
-const CLONE_FLAGS_ARG: u8 = 1;
-#[cfg(not(target_arch = "s390x"))]
+/// Index of `clone`'s flags argument (seccompiler supports only x86_64,
+/// aarch64 and riscv64, where it is the first).
 const CLONE_FLAGS_ARG: u8 = 0;
+
+/// The seccompiler target for an `ARCH` name, or why there is none.
+fn seccomp_arch_for(arch: &str) -> Result<seccompiler::TargetArch, String> {
+    arch.try_into()
+        .map_err(|_| format!("seccomp filters are not supported on target architecture {arch:?}"))
+}
 
 /// The seccomp filters, installed in this order. Each one is a separate
 /// kernel filter; for any syscall the most restrictive verdict wins, and
@@ -1798,21 +1815,25 @@ const CLONE_FLAGS_ARG: u8 = 0;
 ///    seccompiler's arch check accepts x32 numbers (they share
 ///    `AUDIT_ARCH_X86_64`), so on a kernel built with x32 support every
 ///    denylisted syscall would otherwise be reachable by its x32 number.
-fn build_seccomp_filters(options: &crate::ConfineOptions) -> Vec<BpfProgram> {
+fn build_seccomp_filters(options: &crate::ConfineOptions) -> Result<Vec<BpfProgram>, String> {
+    let arch = seccomp_arch_for(std::env::consts::ARCH)?;
     #[allow(unused_mut)]
-    let mut programs = vec![build_denylist_filter(options), build_clone3_filter()];
+    let mut programs = vec![
+        build_denylist_filter(options, arch),
+        build_clone3_filter(arch),
+    ];
     #[cfg(target_arch = "x86_64")]
     programs.push(build_x32_filter());
-    programs
+    Ok(programs)
 }
 
-fn build_clone3_filter() -> BpfProgram {
+fn build_clone3_filter(arch: seccompiler::TargetArch) -> BpfProgram {
     let rules = std::iter::once((libc::SYS_clone3, vec![])).collect();
     SeccompFilter::new(
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::ENOSYS as u32),
-        std::env::consts::ARCH.try_into().expect("known arch"),
+        arch,
     )
     .expect("static seccomp policy is well-formed")
     .try_into()
@@ -1845,7 +1866,10 @@ fn build_x32_filter() -> BpfProgram {
     ]
 }
 
-fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
+fn build_denylist_filter(
+    options: &crate::ConfineOptions,
+    arch: seccompiler::TargetArch,
+) -> BpfProgram {
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = BLOCKED_SYSCALLS
         .iter()
         .map(|&syscall| (syscall, vec![]))
@@ -1932,7 +1956,7 @@ fn build_denylist_filter(options: &crate::ConfineOptions) -> BpfProgram {
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
-        std::env::consts::ARCH.try_into().expect("known arch"),
+        arch,
     )
     .expect("static seccomp policy is well-formed")
     .try_into()
@@ -1968,6 +1992,14 @@ impl LandlockConfiner {
                 Some(dir) => command.env("TMPDIR", dir.path()),
                 None => command.env_remove("TMPDIR"),
             };
+        }
+
+        if let Some(why) = &self.seccomp_unavailable {
+            tracing::warn!(error = %why, "refusing to run: seccomp filters are unavailable");
+            unsafe {
+                command.pre_exec(|| Err(io::Error::from_raw_os_error(libc::EACCES)));
+            }
+            return command;
         }
 
         #[cfg(test)]
@@ -2603,6 +2635,26 @@ mod tests {
         assert!(!output.contains("top secret"));
     }
 
+    #[tokio::test]
+    async fn spawns_are_refused_when_seccomp_is_unavailable() {
+        let dir = fixture_dir();
+        let mut confiner = LandlockConfiner::new(dir.path(), &[], &[], false);
+        confiner.seccomp_unavailable = Some("test".to_string());
+        let err = confiner
+            .confine(tokio::process::Command::new("true"))
+            .status()
+            .await
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+    }
+
+    #[test]
+    fn an_unsupported_architecture_is_an_error_not_a_panic() {
+        assert!(seccomp_arch_for(std::env::consts::ARCH).is_ok());
+        let err = seccomp_arch_for("s390x").unwrap_err();
+        assert!(err.contains("s390x"), "{err}");
+    }
+
     // --- Directory operations in a carved-out directory (audit I1) ------
 
     #[tokio::test]
@@ -2619,6 +2671,9 @@ mod tests {
             // The new file has no rights of its own yet, so some `touch`
             // implementations (uutils) report EACCES after creating it;
             // what matters is that MakeReg let it come into existence.
+            // (`: > newfile` is no better: the shell's write-open of the
+            // new file is refused the same way, so the `|| true` stays and
+            // `test -f` is the real check.)
             .args([
                 "-c",
                 "ls . && { touch newfile || true; } && test -f newfile && mkdir newdir",
