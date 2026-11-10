@@ -38,8 +38,8 @@ covers this).
 
 > **Why this exists:** without it, the relicense and the commercial
 > offering could not legally cover contributed lines. This gate must
-> precede any external PR — see the ecosystem's own
-> [`LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-ecosystem/blob/main/LICENSING.md).
+> precede any external PR — see Aivyx PA's
+> [`docs/LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-pa/blob/main/docs/LICENSING.md).
 
 ## Before you open a PR
 

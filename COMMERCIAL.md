@@ -9,9 +9,9 @@ applies to every BUSL-1.1 repository in the Aivyx-Agent organization —
 see each repository's own `LICENSE` for its exact terms.
 
 > The authoritative terms are in each repository's own `LICENSE`; the
-> reasoning behind the model is in this ecosystem's
-> [`LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-ecosystem/blob/main/LICENSING.md)
-> and, for `aivyx-pa` specifically, `aivyx-pa/docs/LICENSING.md`. Where
+> reasoning behind the model is in Aivyx PA's
+> [`docs/LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-pa/blob/main/docs/LICENSING.md);
+> every BUSL-1.1 repository in the organization follows that model. Where
 > this page and a repository's `LICENSE` ever appear to differ, that
 > repository's `LICENSE` governs.
 
