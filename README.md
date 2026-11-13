@@ -3,6 +3,8 @@
 [![CI](https://github.com/Aivyx-Agent/aivyx-confine/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Aivyx-Agent/aivyx-confine/actions/workflows/ci.yml)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
+Part of the [Aivyx Ecosystem](https://aivyx-ecosystem.com/building-blocks/): a shared building block of [Aivyx PA](https://aivyx-ecosystem.com/pa/) and [aivyx-coder](https://aivyx-ecosystem.com/coder/).
+
 OS-level process confinement (Landlock + seccomp-bpf) for spawned command
 execution.
 
