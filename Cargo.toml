@@ -8,19 +8,25 @@ publish = false
 
 [dependencies]
 globset = "0.4.18"
+tokio = { version = "1.52.3", features = ["process"] }
+tracing = "0.1.44"
+
+# The backend is Linux-only (Landlock, seccomp-bpf). Elsewhere these aren't
+# built and `sandbox-backend` compiles to the NoopConfiner build, so a
+# product can keep the feature on for every target (one feature set for a
+# multi-platform release) and still build on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4.5", optional = true }
 libc = { version = "0.2.186", optional = true }
 seccompiler = { version = "0.5.0", optional = true }
 tempfile = { version = "3.27.0", optional = true }
-tokio = { version = "1.52.3", features = ["process"] }
-tracing = "0.1.44"
 
 [features]
 default = ["sandbox-backend"]
 # Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf
-# syscall denylist). Opt out with `--no-default-features` on
-# platforms/kernels where it isn't available — `NoopConfiner` remains the
-# fallback.
+# syscall denylist) on Linux. On other platforms it has no effect: the
+# build is the same as without it (`NoopConfiner`). Opt out with
+# `--no-default-features` on Linux kernels where it isn't available.
 sandbox-backend = ["dep:landlock", "dep:libc", "dep:seccompiler", "dep:tempfile"]
 
 [dev-dependencies]

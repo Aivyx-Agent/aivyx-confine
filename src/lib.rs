@@ -5,16 +5,17 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 mod confiner;
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 pub use confiner::{LandlockConfiner, kill_process_group};
 
-/// Without the `sandbox-backend` feature only `NoopConfiner` exists, and it
+/// Without the backend (the `sandbox-backend` feature off, or not Linux)
+/// only `NoopConfiner` exists, and it
 /// never creates a process group, so there is never a group to kill: this
 /// does nothing and returns `Ok(())`. It exists so consumers can call
 /// `kill_process_group` unconditionally instead of `cfg`-gating the call.
-#[cfg(not(feature = "sandbox-backend"))]
+#[cfg(not(all(feature = "sandbox-backend", target_os = "linux")))]
 pub fn kill_process_group(_pgid: u32) -> std::io::Result<()> {
     Ok(())
 }
@@ -168,8 +169,8 @@ impl ConfineOptions {
 }
 
 /// Builds the best confiner available for this build: `LandlockConfiner`
-/// when the `sandbox-backend` feature is enabled (the default), otherwise
-/// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
+/// when the `sandbox-backend` feature is enabled (the default) on Linux,
+/// otherwise `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
 /// in every caller. Equivalent to `default_confiner_with_options` with
 /// `ConfineOptions::new().require_enforcement(require_enforcement)`.
 pub fn default_confiner(
@@ -188,7 +189,7 @@ pub fn default_confiner(
 
 /// `default_confiner` with every policy knob exposed — see
 /// `ConfineOptions`.
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 pub fn default_confiner_with_options(
     cwd: &Path,
     extra_read_paths: &[PathBuf],
@@ -203,7 +204,7 @@ pub fn default_confiner_with_options(
     ))
 }
 
-#[cfg(not(feature = "sandbox-backend"))]
+#[cfg(not(all(feature = "sandbox-backend", target_os = "linux")))]
 pub fn default_confiner_with_options(
     _cwd: &Path,
     _extra_read_paths: &[PathBuf],
